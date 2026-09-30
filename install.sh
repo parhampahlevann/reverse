@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  ESP Tunnel Manager  -  point-to-point tunnel over IP protocol 50 (ESP)
-#                         + Rathole reverse tunnel carried inside it
+#  ESP Tunnel Manager v2.2 - point-to-point tunnel over IP protocol 50 (ESP)
+#                            + Rathole reverse tunnel carried inside it
 #
 #    Iran server   : 10.10.10.2   (menu option 1)   rathole SERVER
 #    Kharej client : 10.10.10.1   (menu option 2)   rathole CLIENT
@@ -9,54 +9,41 @@
 #  How it works
 #   * Linux kernel XFRM (IPsec ESP) + an "xfrm interface" (espt0) on each side.
 #     No IKE daemon and no handshake: only encrypted ESP packets hit the wire.
-#   * Cipher: AES-256-GCM in the kernel (AES-NI accelerated, very light).
-#   * One random master key (shown once as a "token" on the Iran server).
-#     Per-direction session keys are derived from it and rotate every hour
-#     with zero downtime (both sides derive the same keys from the UTC clock;
-#     the previous/current/next hour inbound SAs are always loaded).
-#   * The xfrm policies only allow traffic between 10.10.10.2 <-> 10.10.10.1.
-#   * Optional fallback transport: ESP-in-UDP (for NAT / when protocol 50 is
-#     blocked by the datacenter or ISP).
+#   * AES-256-GCM in the kernel. One random master key (the "token"); per-direction
+#     session keys are derived from it and rotate every hour from the UTC clock
+#     (previous/current/next hour inbound SAs are always loaded -> no downtime).
+#   * Transport: ESP-in-UDP (default - survives NAT and protocol-50 filtering)
+#     or raw ESP (IP protocol 50).
+#   * Rathole (reverse tunnel) runs inside the tunnel: the Kharej client dials
+#     10.10.10.2:8090 through ESP, the Iran server opens the public ports.
 #
-#  v2.0 rathole reverse tunnel
-#   * The rathole core (official release, downloaded automatically) is installed
-#     on BOTH servers. The Kharej rathole client dials OUT to the Iran rathole
-#     server at 10.10.10.2:8090 - that connection (source 10.10.10.1) travels
-#     inside the ESP tunnel, so the reverse tunnel is encrypted by ESP and the
-#     control port is not reachable from the internet.
-#   * Port forwarding is no longer done by iptables DNAT on the Iran server.
-#     The Iran rathole server opens the public ports; every connection is pushed
-#     back through the reverse tunnel and the Kharej rathole client hands it to
-#     the local service (default target 127.0.0.1:<port>, configurable).
-#   * Rathole runs as its own systemd unit (esp-tunnel-rathole) that depends on
-#     the ESP service. Auth token and config are derived from the master key.
-#   * Installs done by older versions (iptables DNAT) keep working unchanged
-#     until you re-install (engine "dnat").
-#
-#  v2.1 fixes
-#   * Transport prompt now defaults to ESP-in-UDP (raw protocol 50 is dropped by some
-#     providers/ISPs - typically the tunnel then works for a few seconds or only in one
-#     direction). Raw ESP is still option 1.
-#   * Watchdog back-off: rebuilds that do not bring the link back no longer repeat every
-#     minute (2 min, 4 min, ... up to 15 min) and the log says why. A rebuild cannot fix a
-#     network that drops the packets.
-#   * Health check shows ESP packets sent / received per side and explains one-way loss.
-#   * rathole.toml is written atomically (no half-written file seen by rathole's watcher).
-#   * Warns about leftover cron jobs that mention esp-tunnel (they fight the watchdog).
-#   * The rathole port list may no longer contain the ESP-in-UDP port.
-#
-#  v1.1 watchdog (unchanged)
-#   * asymmetric-blackout detector (TX moving, RX frozen) -> early rebuild
-#   * xfrm error counters polled every cycle, forensic snapshot before rebuilds
-#   * unconditional preventive rebuild every FORCE_REBUILD_SEC (default 12h)
-#   * on-demand health check (Live Log -> option 4)
+#  v2.2 - fixes for "no ping / no connection after install"
+#   * NEW Diagnose (menu 11 / `esp-tunnel diag`): measures packets during a live test and
+#     names the cause: route conflict, nothing encrypted, UDP port blocked, clock skew,
+#     key/token mismatch, packets arriving but not decrypted, local firewall.
+#   * NEW UDP probe: the UDP helper answers clear-text probes (no crypto) so a blocked UDP
+#     port is told apart from a configuration problem, and the peer's clock offset is measured.
+#   * NEW menu 12: change transport / UDP port on both sides without re-installing.
+#   * NEW menu 13: sync the system clock from an HTTPS Date header (NTP is often blocked in
+#     Iran; hourly key rotation needs both clocks within < 1 hour of each other).
+#   * NEW pre-flight checks: other IPsec daemons, 10.10.10.0/24 used by another interface,
+#     UDP port already taken, nftables/firewalld present, clock not synchronised.
+#   * Watchdog no longer rebuilds the tunnel every few minutes before the peer has ever
+#     answered (it destroyed the counters and firewall rules while the other side was
+#     still being installed); after the first contact it behaves as before.
+#   * UDP helper: restart race fixed (old socket must be gone before the new bind), stale
+#     pid can no longer kill an unrelated process, bind errors are reported.
+#   * Kernel self-test now also checks iproute2 if_id / encap support.
+#   * Reply rule for probes in the firewall chain; awk package mapping fixed; fewer forks
+#     in the watchdog loop (bash built-ins instead of date/cat/awk on every cycle).
 #
 #  Usage:  bash esp-tunnel.sh        (interactive menu, run as root)
 #          esp-tunnel                (after first install)
+#          esp-tunnel diag           (diagnosis without the menu)
 # ==============================================================================
 
 APP="esp-tunnel"
-VERSION="2.1"
+VERSION="2.2"
 BIN="/usr/local/bin/${APP}"
 CONF_DIR="/etc/${APP}"
 CONF="${CONF_DIR}/config"
@@ -102,19 +89,60 @@ ENGINE=""; RH_PORT="$DEFAULT_RH_PORT"; RH_TARGET="127.0.0.1"; RH_AUTH=""
 
 # ---- daemon watchdog state (globals; meaningful only while cmd_daemon runs) --
 RX0=0; TX0=0; RX_STALL_START=0; LAST_REBUILD=0; FAILS=0; PEER_STATE="unknown"; XPREV=""
-REB_N=0; BACKOFF_UNTIL=0; UP_SINCE=0
+REB_N=0; BACKOFF_UNTIL=0; UP_SINCE=0; EVER_UP=0; CNT_RX=0; CNT_TX=0
 
+# UDP socket that lets the kernel decapsulate ESP-in-UDP. The kernel hands packets that start
+# with four zero bytes (the "non-ESP marker") to user space: those are used as clear-text probes.
 PY_UDP='
-import socket, sys
+import socket, sys, time
 port = int(sys.argv[1])
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.bind(("0.0.0.0", port))
 s.setsockopt(socket.IPPROTO_UDP, 100, 2)   # UDP_ENCAP = UDP_ENCAP_ESPINUDP
 while True:
     try:
-        s.recvfrom(65535)
+        d, a = s.recvfrom(2048)
+        if d[:9] == b"\x00\x00\x00\x00ESPT?":
+            s.sendto(b"\x00\x00\x00\x00ESPT!" + d[9:40] + b"|" + str(int(time.time() * 1000)).encode(), a)
+    except Exception:
+        time.sleep(0.05)
+'
+
+# Probe client: prints "<replies> <sent> <avg rtt ms | -> <peer clock offset s | ->"
+PY_PROBE='
+import socket, sys, time, os
+host, port, n = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(1.0)
+ok = 0
+rtt = []
+skew = []
+for i in range(n):
+    nonce = os.urandom(4).hex().encode()
+    t0 = time.time()
+    t1 = t0
+    got = None
+    try:
+        s.sendto(b"\x00\x00\x00\x00ESPT?" + nonce, (host, port))
+        while True:
+            d, a = s.recvfrom(2048)
+            t1 = time.time()
+            if d.startswith(b"\x00\x00\x00\x00ESPT!" + nonce):
+                got = d
+                break
     except Exception:
         pass
+    if got is not None:
+        ok += 1
+        rtt.append((t1 - t0) * 1000.0)
+        try:
+            skew.append(int(got.split(b"|")[1]) / 1000.0 - (t0 + t1) / 2.0)
+        except Exception:
+            pass
+    time.sleep(0.2)
+r = "%.0f" % (sum(rtt) / len(rtt)) if rtt else "-"
+k = "%.0f" % (sum(skew) / len(skew)) if skew else "-"
+print(ok, n, r, k)
 '
 
 # ------------------------------------------------------------------------------
@@ -131,6 +159,7 @@ warn() { echo "${C_Y}[!]${C_0} $*" >&2; }
 err()  { echo "${C_R}[x]${C_0} $*" >&2; }
 log()  { echo "[${APP}] $*"; }          # daemon logs (journald adds timestamps)
 have() { command -v "$1" >/dev/null 2>&1; }
+row()  { printf '  %-16s %s\n' "$1" "$2"; }
 
 need_root() {
   if [[ $EUID -ne 0 ]]; then
@@ -334,7 +363,7 @@ parse_token() {
 }
 
 # ------------------------------------------------------------------------------
-#  Pre-flight: dependencies + kernel support
+#  Pre-flight: dependencies, kernel support, conflicts, clock
 # ------------------------------------------------------------------------------
 ensure_deps() {
   local c pm=""
@@ -359,6 +388,7 @@ ensure_deps() {
     case $c in
       ip|ss)   [[ $pm == apt ]] && pkgs+=(iproute2) || pkgs+=(iproute) ;;
       ping)    [[ $pm == apt ]] && pkgs+=(iputils-ping) || pkgs+=(iputils) ;;
+      awk)     pkgs+=(gawk) ;;
       iptables|python3|unzip|curl) pkgs+=("$c") ;;
       *)       pkgs+=(coreutils) ;;
     esac
@@ -378,7 +408,7 @@ ensure_deps() {
 
 load_modules() {
   local m
-  for m in xfrm_interface xfrm_user esp4 gcm aesni_intel nf_conntrack xt_TCPMSS iptable_nat; do
+  for m in xfrm_interface xfrm_user esp4 gcm aesni_intel nf_conntrack xt_TCPMSS iptable_nat iptable_filter iptable_mangle; do
     modprobe -q "$m" 2>/dev/null
   done
   return 0
@@ -386,6 +416,7 @@ load_modules() {
 
 check_kernel() {
   local t="espchk0" out virt k
+  local -a enc=()
   virt=$(systemd-detect-virt 2>/dev/null)
   case $virt in
     openvz|lxc|lxc-libvirt) warn "Virtualization '$virt' detected - XFRM/IPsec normally does NOT work inside containers." ;;
@@ -393,18 +424,69 @@ check_kernel() {
   load_modules
   ip link del "$t" 2>/dev/null
   if ! out=$(ip link add "$t" type xfrm dev lo if_id 4242 2>&1); then
-    err "This kernel has no XFRM-interface support: $out"
-    err "Needs Linux >= 4.19 (uname -r) on a real/KVM server (not OpenVZ/LXC)."
+    err "This system has no XFRM-interface support: $out"
+    err "Needs Linux >= 4.19 (uname -r), iproute2 >= 5.0 and a real/KVM server (not OpenVZ/LXC)."
     return 1
   fi
   ip link del "$t" 2>/dev/null
   k=$(printf '%072d' 0)
-  if ! out=$(ip xfrm state add src 127.0.0.2 dst 127.0.0.3 proto esp spi 0x1c0ffee0 mode tunnel \
-             aead 'rfc4106(gcm(aes))' "0x$k" 128 2>&1); then
-    err "Kernel lacks AES-GCM ESP support: $out"
+  [[ $MODE == udp ]] && enc=(encap espinudp 4500 4500 0.0.0.0)
+  if ! out=$(ip xfrm state add src 127.0.0.2 dst 127.0.0.3 proto esp spi 0x1c0ffee0 reqid 4242 mode tunnel \
+             aead 'rfc4106(gcm(aes))' "0x$k" 128 "${enc[@]}" if_id 4242 2>&1); then
+    err "Cannot create an AES-GCM ESP state (kernel crypto, or iproute2 without if_id/encap support): $out"
     return 1
   fi
   ip xfrm state delete src 127.0.0.2 dst 127.0.0.3 proto esp spi 0x1c0ffee0 2>/dev/null
+  if ! out=$(ip xfrm policy add src 10.255.255.1/32 dst 10.255.255.2/32 dir out if_id 4242 \
+             tmpl src 127.0.0.2 dst 127.0.0.3 proto esp reqid 4242 mode tunnel 2>&1); then
+    err "Cannot create an XFRM policy with if_id (iproute2 too old?): $out"
+    return 1
+  fi
+  ip xfrm policy delete src 10.255.255.1/32 dst 10.255.255.2/32 dir out if_id 4242 2>/dev/null
+  return 0
+}
+
+clock_status() {
+  local ntp=""
+  have timedatectl && ntp=$(timedatectl show -p NTPSynchronized --value 2>/dev/null)
+  echo "Clock (UTC)   : $(date -u '+%F %T')   NTP synchronized: ${ntp:-unknown}"
+}
+
+# Things that silently break the tunnel: warn before installing
+preflight_check() {
+  local p lst holder bad=0
+  have systemctl && ! systemctl is-active --quiet "$APP" 2>/dev/null && udp_helper_stop   # stale helper of a crashed run
+  if have pgrep; then
+    for p in charon charon-systemd pluto racoon iked; do
+      if pgrep -x "$p" >/dev/null 2>&1; then
+        warn "IPsec daemon '${p}' is running - it can take over UDP 500/4500 and the XFRM policies and break this tunnel."
+        bad=1
+      fi
+    done
+  fi
+  lst=$(ip -4 -o addr show 2>/dev/null | awk -v ifn="$IF_NAME" '$2 != ifn && $4 ~ /^10\.10\.10\./ {print "    addr  " $2 "  " $4}')
+  lst+=$'\n'$(ip -4 route show 2>/dev/null | awk -v ifn="$IF_NAME" '$1 ~ /^10\.10\.10\./ && $0 !~ ("dev " ifn) {print "    route " $0}')
+  lst=$(sed '/^[[:space:]]*$/d' <<< "$lst")
+  if [[ -n $lst ]]; then
+    err "Something else already uses the tunnel subnet 10.10.10.0/24 - tunnel traffic would be routed wrongly:"
+    echo "$lst" >&2
+    bad=1
+  fi
+  if [[ $MODE == udp ]] && ! systemctl is-active --quiet "$APP" 2>/dev/null; then
+    if [[ -n $(ss -Hlun "sport = :${UDP_PORT}" 2>/dev/null) ]]; then
+      holder=$(ss -Hlunp "sport = :${UDP_PORT}" 2>/dev/null | grep -o 'users:(("[^"]*"' | head -n1)
+      err "UDP port ${UDP_PORT} is already in use on this server ${holder}. Stop that service or choose another port."
+      return 1
+    fi
+  fi
+  if have nft; then
+    lst=$(nft list tables 2>/dev/null | awk '$2 == "inet" || $2 == "netdev" || $2 == "bridge" {printf "%s/%s ", $2, $3}')
+    [[ -n $lst ]] && warn "nftables tables present (${lst}): if one of them drops input traffic, allow the peer's tunnel packets and interface ${IF_NAME}."
+  fi
+  if have timedatectl && [[ $(timedatectl show -p NTPSynchronized --value 2>/dev/null) == no ]]; then
+    warn "The system clock is not NTP-synchronised. Both servers must show the same UTC time (well under 1 hour apart) - see menu 13."
+  fi
+  if (( bad )); then confirm "Continue anyway?" n || return 1; fi
   return 0
 }
 
@@ -445,6 +527,7 @@ fw_apply() {
   ipt -A ESPT_IN -i "$IF_NAME" -j ACCEPT
   if [[ $MODE == udp ]]; then
     ipt -A ESPT_IN -p udp -s "$PEER_PUB" --dport "$UDP_PORT" -j ACCEPT
+    ipt -A ESPT_IN -p udp -s "$PEER_PUB" --sport "$UDP_PORT" -j ACCEPT   # replies to our own probes
   else
     ipt -A ESPT_IN -p 50 -s "$PEER_PUB" -j ACCEPT
   fi
@@ -485,6 +568,16 @@ fw_apply() {
   return 0
 }
 
+# transport packets from the peer accepted since the firewall chain was (re)loaded
+outer_rx_count() {
+  ipt -nvxL ESPT_IN 2>/dev/null | awk -v p="$PEER_PUB" -v m="$MODE" -v port="$UDP_PORT" '
+    $3 == "ACCEPT" && $8 == p {
+      if (m == "udp") { if ($4 == "udp" && $0 ~ ("dpt:" port "( |$)")) s += $1 }
+      else if ($4 == "esp" || $4 == "50") s += $1
+    }
+    END { print s + 0 }'
+}
+
 sysctl_apply() {
   printf 'net.ipv4.ip_forward = 1\n' > "$SYSCTL_FILE"
   sysctl -qw net.ipv4.ip_forward=1 >/dev/null 2>&1
@@ -501,6 +594,7 @@ iface_setup() {
   if ! out=$(ip link add "$IF_NAME" type xfrm dev "$WAN_DEV" if_id "$IF_ID" 2>&1); then
     log "ERROR: cannot create interface $IF_NAME: $out"; return 1
   fi
+  have nmcli && nmcli device set "$IF_NAME" managed no >/dev/null 2>&1
   ip addr add "${LOCAL_INNER}/${NET_PREFIX}" dev "$IF_NAME" || { log "ERROR: cannot set $LOCAL_INNER on $IF_NAME"; return 1; }
   ip link set "$IF_NAME" mtu "$MTU" up            || { log "ERROR: cannot bring $IF_NAME up"; return 1; }
   return 0
@@ -609,22 +703,38 @@ sa_flush() {
 }
 
 udp_helper_stop() {
-  if [[ -f $UDP_PID_FILE ]]; then
-    kill "$(cat "$UDP_PID_FILE")" 2>/dev/null
-    rm -f "$UDP_PID_FILE"
+  local pid i
+  [[ -f $UDP_PID_FILE ]] || return 0
+  pid=$(<"$UDP_PID_FILE")
+  # only ever kill our own helper (a stale pid file may point at an unrelated process)
+  if [[ $pid =~ ^[0-9]+$ ]] && { tr '\0' ' ' < "/proc/${pid}/cmdline"; } 2>/dev/null | grep -q 'ESPT'; then
+    kill "$pid" 2>/dev/null
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
   fi
+  rm -f "$UDP_PID_FILE"
+  return 0
 }
 
 udp_helper_start() {   # holds the UDP socket that lets the kernel decapsulate ESP-in-UDP
+  local pid i
   udp_helper_stop
-  python3 -c "$PY_UDP" "$UDP_PORT" >/dev/null 2>&1 &
-  echo $! > "$UDP_PID_FILE"
-  sleep 0.7
-  if ! kill -0 "$(cat "$UDP_PID_FILE")" 2>/dev/null; then
-    log "ERROR: cannot open UDP port $UDP_PORT for ESP-in-UDP (already in use?)"
-    return 1
-  fi
-  return 0
+  mkdir -p "$RUN_DIR"
+  python3 -c "$PY_UDP" "$UDP_PORT" >/dev/null 2>"${RUN_DIR}/udp.err" &
+  pid=$!
+  echo "$pid" > "$UDP_PID_FILE"
+  for i in 1 2 3 4 5 6 7 8; do
+    sleep 0.25
+    kill -0 "$pid" 2>/dev/null || break
+    ss -Hlunp "sport = :${UDP_PORT}" 2>/dev/null | grep -q "pid=${pid}," && return 0
+  done
+  kill -0 "$pid" 2>/dev/null && return 0
+  log "ERROR: cannot open UDP port ${UDP_PORT} for ESP-in-UDP (already in use?): $(tr '\n' ' ' < "${RUN_DIR}/udp.err" 2>/dev/null)"
+  rm -f "$UDP_PID_FILE"
+  return 1
 }
 
 teardown_all() {
@@ -900,11 +1010,12 @@ rh_post_rebuild() {
 # ------------------------------------------------------------------------------
 #  Watchdog helpers: interface counters, xfrm error counters, forensic dump
 # ------------------------------------------------------------------------------
-if_counters() {   # prints "<rx_bytes> <tx_bytes>" for $IF_NAME
-  local r t
-  r=$(cat "/sys/class/net/${IF_NAME}/statistics/rx_bytes" 2>/dev/null) || r=0
-  t=$(cat "/sys/class/net/${IF_NAME}/statistics/tx_bytes" 2>/dev/null) || t=0
-  echo "${r:-0} ${t:-0}"
+read_counters() {   # sets CNT_RX / CNT_TX (bytes) without forking
+  local d="/sys/class/net/${IF_NAME}/statistics"
+  CNT_RX=0; CNT_TX=0
+  [[ -r $d/rx_bytes ]] && CNT_RX=$(<"$d/rx_bytes")
+  [[ -r $d/tx_bytes ]] && CNT_TX=$(<"$d/tx_bytes")
+  return 0
 }
 
 # "<packets sent> <packets received+decrypted>" summed over this tunnel's loaded SAs
@@ -921,9 +1032,8 @@ xfrm_nonzero_counters() {   # e.g. "XfrmInStateProtoError=3 XfrmInTmplMismatch=1
 }
 
 # Dumps SA state, interface counters, xfrm error counters and recent *kernel*
-# log (not the whole boot buffer) so a rebuild that just happened is still
-# diagnosable afterwards. Uses fd 3 for the SA-registry loop so the inner
-# `... | while read` pipelines don't fight over stdin.
+# log so a rebuild that just happened is still diagnosable afterwards.
+# Uses fd 3 for the SA-registry loop so the inner pipelines don't fight over stdin.
 forensic_snapshot() {
   local reason=$1 dir ep spi src dst line
   log "----- forensic snapshot: ${reason} -----"
@@ -938,6 +1048,7 @@ forensic_snapshot() {
   ip -s link show "$IF_NAME" 2>&1 | while IFS= read -r line; do log "link: ${line}"; done
   local x; x=$(xfrm_nonzero_counters)
   log "xfrm error counters: ${x:-none (clean)}"
+  log "outer packets accepted from the peer since the last rule load: $(outer_rx_count)"
   journalctl -k -n 40 --no-pager 2>/dev/null | while IFS= read -r line; do log "kernel: ${line}"; done
   log "----- end forensic snapshot -----"
 }
@@ -958,7 +1069,7 @@ watchdog_rebuild() {   # watchdog_rebuild "<reason>" [skip-forensic]
   else
     log "ERROR: rebuild attempt failed, will retry next cycle"
   fi
-  LAST_REBUILD=$(date +%s)
+  printf -v LAST_REBUILD '%(%s)T' -1
   UP_SINCE=0
   # unscheduled rebuilds that do not bring the link back: back off instead of repeating every minute
   if [[ ${2:-} != skip-forensic ]]; then
@@ -968,22 +1079,22 @@ watchdog_rebuild() {   # watchdog_rebuild "<reason>" [skip-forensic]
       BACKOFF_UNTIL=$(( LAST_REBUILD + back ))
       log "WARN: ${REB_N} rebuilds in a row did not bring the link back - next automatic rebuild in ${back}s at the earliest"
       if (( REB_N == 3 )); then
-        log "HINT: a rebuild cannot fix a network that drops the packets. Run the health check (Live Log -> 4) on BOTH servers;"
-        log "HINT: if one side sends ESP but the other receives none, re-install both sides with transport 2 (ESP-in-UDP)."
+        log "HINT: a rebuild cannot fix a network that drops the packets. Run the diagnosis (menu 11) on BOTH servers;"
+        log "HINT: if one side sends ESP but the other receives none, change transport/port (menu 12)."
       fi
     fi
   fi
   RX_STALL_START=0
   FAILS=0
   PEER_STATE="unknown"
-  read -r RX0 TX0 <<< "$(if_counters)"
+  read_counters; RX0=$CNT_RX; TX0=$CNT_TX
 }
 
 # ------------------------------------------------------------------------------
 #  Daemon (runs under systemd): setup, hourly key rotation, health watchdog
 # ------------------------------------------------------------------------------
 cmd_daemon() {
-  local tries=0 last_fix=0 e now xcur rx tx
+  local tries=0 last_fix=0 e now xcur tick=0
   load_config || { log "ERROR: missing or invalid $CONF"; exit 1; }
   mkdir -p "$RUN_DIR"
   trap 'log "stop signal received"; exit 0' TERM INT
@@ -993,15 +1104,18 @@ cmd_daemon() {
     sleep 2
   done
   setup_all || { log "ERROR: setup failed"; exit 1; }
-  LAST_REBUILD=$(date +%s)
-  read -r RX0 TX0 <<< "$(if_counters)"
+  printf -v LAST_REBUILD '%(%s)T' -1
+  read_counters; RX0=$CNT_RX; TX0=$CNT_TX
   XPREV=$(xfrm_nonzero_counters)
+  EVER_UP=0
   log "watchdog active: rx-stall trigger ${RX_STALL_SEC}s, preventive rebuild $( (( FORCE_REBUILD_SEC > 0 )) && echo "every $((FORCE_REBUILD_SEC/3600))h" || echo disabled)"
+  log "waiting for the peer $PEER_INNER (the other side must be installed and its service running)"
 
   while true; do
     sleep 5 &
     wait $!
-    now=$(date +%s)
+    printf -v now '%(%s)T' -1
+    tick=$(( tick + 1 ))
 
     # --- hourly key rotation (make-before-break, no packet loss) ---
     e=$(( now / EPOCH_LEN ))
@@ -1022,30 +1136,32 @@ cmd_daemon() {
       continue
     fi
 
-    # --- xfrm kernel error counters: early warning, logged even without a rebuild ---
-    xcur=$(xfrm_nonzero_counters)
-    if [[ -n $xcur && $xcur != "$XPREV" ]]; then
-      log "WARN: new xfrm error counters: $xcur"
+    # --- xfrm kernel error counters (every 30 s): early warning, logged even without a rebuild ---
+    if (( tick % 6 == 0 )); then
+      xcur=$(xfrm_nonzero_counters)
+      if [[ -n $xcur && $xcur != "$XPREV" ]]; then
+        log "WARN: new xfrm error counters: $xcur"
+      fi
+      XPREV=$xcur
     fi
-    XPREV=$xcur
 
-    # --- asymmetric blackout: outbound flowing, nothing received (the exact
-    #     pattern seen in production - TX climbing, RX frozen on both ends) ---
-    read -r rx tx <<< "$(if_counters)"
-    if (( tx > TX0 && rx == RX0 )); then
+    # --- asymmetric blackout: outbound flowing, nothing received. Only after the peer has
+    #     answered at least once - before that "no inbound" is normal (peer not installed yet) ---
+    read_counters
+    if (( EVER_UP && CNT_TX > TX0 && CNT_RX == RX0 )); then
       (( RX_STALL_START == 0 )) && RX_STALL_START=$now
       if (( now - RX_STALL_START >= RX_STALL_SEC && now >= BACKOFF_UNTIL )); then
         watchdog_rebuild "asymmetric blackout: no inbound traffic for ${RX_STALL_SEC}s while outbound is active"
         continue
       fi
     else
-      RX_STALL_START=0; RX0=$rx; TX0=$tx
+      RX_STALL_START=0; RX0=$CNT_RX; TX0=$CNT_TX
     fi
 
     # --- ping watchdog (also exercises the path when otherwise idle) ---
     if ping -c1 -W1 -I "$IF_NAME" "$PEER_INNER" >/dev/null 2>&1; then
       if [[ $PEER_STATE != up ]]; then log "peer $PEER_INNER reachable - tunnel UP"; fi
-      PEER_STATE=up; FAILS=0
+      PEER_STATE=up; FAILS=0; EVER_UP=1
       (( UP_SINCE == 0 )) && UP_SINCE=$now
       if (( now - UP_SINCE >= 120 )); then REB_N=0; BACKOFF_UNTIL=0; fi   # stable for 2 min: forget past failures
     else
@@ -1055,7 +1171,11 @@ cmd_daemon() {
       if (( FAILS >= 12 )); then
         if (( now - last_fix >= 180 && now >= BACKOFF_UNTIL )); then
           last_fix=$now
-          watchdog_rebuild "peer unreachable (ping) for 60s+"
+          if (( EVER_UP || REB_N == 0 )); then
+            watchdog_rebuild "peer unreachable (ping) for 60s+"
+          else
+            log "still no answer from $PEER_INNER (never reached since start) - not rebuilding; run the diagnosis (menu 11) on both servers"
+          fi
         fi
         FAILS=3
       fi
@@ -1127,6 +1247,15 @@ start_service() {
   start_rathole
 }
 
+wait_link() {   # wait_link <seconds>  -> 0 as soon as the peer answers a ping through the tunnel
+  local i t=${1:-15}
+  for (( i = 0; i < t; i++ )); do
+    ping -c1 -W1 -I "$IF_NAME" "$PEER_INNER" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  return 1
+}
+
 confirm_reinstall() {
   if load_config 2>/dev/null; then
     warn "A tunnel is already configured on this server (role: $ROLE)."
@@ -1189,7 +1318,7 @@ ask_transport() {
   local c
   echo
   echo "Transport:"
-  echo "  1) Raw ESP - IP protocol 50   (fastest, smallest overhead - but some providers/ISPs drop protocol 50:"
+  echo "  1) Raw ESP - IP protocol 50   (fastest, smallest overhead - but many providers/ISPs drop protocol 50:"
   echo "                                 the tunnel then never comes up, or works only for a few seconds / one way)"
   echo "  2) ESP-in-UDP                 (recommended between Iran and abroad: looks like ordinary UDP, survives NAT)"
   read -r -p "Select [2]: " c
@@ -1205,6 +1334,7 @@ ask_transport() {
       err "Invalid port."
     done
     echo "Remember: UDP ${UDP_PORT} must be open in BOTH servers' external/cloud firewalls."
+    echo "If the tunnel does not come up, try another port later (menu 12) - 4500 is the well-known IPsec NAT-T port and is filtered on some networks."
   fi
 }
 
@@ -1270,6 +1400,160 @@ print_token() {
 }
 
 # ------------------------------------------------------------------------------
+#  Connection tools: UDP probe, diagnosis, clock
+# ------------------------------------------------------------------------------
+udp_probe() {   # udp_probe [count] -> "<replies> <sent> <rtt ms|-> <peer clock offset s|->"
+  python3 -c "$PY_PROBE" "$PEER_PUB" "$UDP_PORT" "${1:-5}" 2>/dev/null
+}
+
+diagnose() {
+  local out loss dev n_pol n_sa k v d x fw_ok rhc
+  local o0=0 i0=0 o1=0 i1=0 r0=0 r1=0 d_out=0 d_in=0 d_rx=0
+  local pr_ok=0 pr_n=5 pr_rtt="-" pr_skew="-" have_probe=0 skew_abs=0 cause="" nz=""
+  local -A XB=()
+
+  if ! load_config 2>/dev/null; then warn "Tunnel is not installed."; return; fi
+  route_info "$PEER_PUB" >/dev/null 2>&1
+  echo "${C_B}=================== ESP tunnel diagnosis ===================${C_0}"
+  echo "Role ${ROLE}:  ${LOCAL_INNER} <-> ${PEER_INNER}      peer public IP ${PEER_PUB}"
+  if [[ $MODE == udp ]]; then echo "Transport: ESP-in-UDP on port ${UDP_PORT}"; else echo "Transport: raw ESP (IP protocol 50)"; fi
+  clock_status
+  echo
+  if ! systemctl is-active --quiet "$APP" 2>/dev/null; then
+    err "Service ${APP} is not running.  Try: systemctl restart ${APP} ; journalctl -u ${APP} -n 40 --no-pager"
+    return
+  fi
+
+  dev=$(ip -4 route get "$PEER_INNER" 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}')
+  n_pol=$(ip xfrm policy 2>/dev/null | grep -cE "^src (${IP_IRAN}|${IP_KHAREJ})/32")
+  n_sa=$(ip xfrm state 2>/dev/null | grep -cE "^src (${LOCAL_ADDR}|${PEER_PUB}) dst (${LOCAL_ADDR}|${PEER_PUB})")
+  x=$(ip -br addr show "$IF_NAME" 2>/dev/null | awk '{print $1, $2, $3}')
+  row "Interface" "${x:-${C_R}${IF_NAME} missing${C_0}}"
+  if [[ $dev == "$IF_NAME" ]]; then row "Route to peer" "via ${IF_NAME} (ok)"; else row "Route to peer" "${C_R}via '${dev:-none}' (must be ${IF_NAME})${C_0}"; fi
+  row "Kernel state" "policies ${n_pol}/3, SAs ${n_sa}/4"
+  if ipt -nL ESPT_IN >/dev/null 2>&1; then fw_ok="loaded"; else fw_ok="${C_R}missing${C_0}"; fi
+  row "Firewall chain" "$fw_ok"
+
+  if [[ $MODE == udp ]] && have python3; then
+    have_probe=1
+    read -r pr_ok pr_n pr_rtt pr_skew <<< "$(udp_probe 5)"
+    pr_ok=${pr_ok:-0}; pr_n=${pr_n:-5}; pr_rtt=${pr_rtt:--}; pr_skew=${pr_skew:--}
+    if (( pr_ok > 0 )); then
+      row "UDP probe" "${pr_ok}/${pr_n} replies from ${PEER_PUB}:${UDP_PORT}, rtt ${pr_rtt} ms, peer clock offset ${pr_skew} s"
+      if [[ $pr_skew =~ ^-?[0-9]+$ ]]; then
+        skew_abs=${pr_skew#-}
+        if (( skew_abs > 60 )); then warn "  the two clocks differ by ${pr_skew}s - fix with menu 13 on the server that is wrong"; fi
+      fi
+    else
+      row "UDP probe" "${C_R}0/${pr_n} replies - nothing answers on ${PEER_PUB}:${UDP_PORT}/udp${C_0}"
+    fi
+  fi
+
+  # --- live measurement: packets counted before/after a short ping burst ---
+  read -r o0 i0 <<< "$(xfrm_pkt_counts)"
+  r0=$(outer_rx_count)
+  if [[ -r /proc/net/xfrm_stat ]]; then
+    while read -r k v; do XB[$k]=$v; done < /proc/net/xfrm_stat
+  fi
+  echo
+  echo "Testing the tunnel (6 pings, ~3 s)..."
+  out=$(LC_ALL=C ping -c 6 -i 0.5 -W 1 -I "$IF_NAME" "$PEER_INNER" 2>&1)
+  tail -n 2 <<< "$out"
+  loss=$(grep -oE '[0-9]+% packet loss' <<< "$out" | grep -oE '^[0-9]+')
+  read -r o1 i1 <<< "$(xfrm_pkt_counts)"
+  r1=$(outer_rx_count)
+  d_out=$(( ${o1:-0} - ${o0:-0} )); d_in=$(( ${i1:-0} - ${i0:-0} )); d_rx=$(( ${r1:-0} - ${r0:-0} ))
+  if [[ -r /proc/net/xfrm_stat ]]; then
+    while read -r k v; do
+      d=$(( v - ${XB[$k]:-0} ))
+      (( d > 0 )) && nz+="${k}(+${d}) "
+    done < /proc/net/xfrm_stat
+  fi
+  echo
+  row "ESP sent" "${d_out} packets encrypted during the test"
+  row "Peer -> here" "${d_rx} transport packets arrived, ${d_in} decrypted"
+  if [[ -n $nz ]]; then
+    row "XFRM errors" "${C_Y}${nz}${C_0}(new during the test)"
+    [[ $nz == *XfrmInNoStates* ]]        && echo "      InNoStates: packets arrive for a key/SPI this server does not have -> different token/key, clocks >= 1 h apart, or the peer uses another transport."
+    [[ $nz == *XfrmInStateProtoError* ]] && echo "      InStateProtoError: decryption/authentication failed -> key mismatch (token from another install?)."
+    [[ $nz == *XfrmInTmplMismatch* || $nz == *XfrmInNoPols* || $nz == *XfrmInPolBlock* ]] && echo "      Inbound policy mismatch -> restart the tunnel (menu 7); look for other IPsec software."
+    [[ $nz == *XfrmOutNoStates* ]]       && echo "      OutNoStates: no outbound key loaded -> restart the tunnel (menu 7)."
+    [[ $nz == *XfrmOutBundleGenError* || $nz == *XfrmOutBundleCheckError* ]] && echo "      OutBundle*: cannot build the outer route to the peer -> check the route to ${PEER_PUB}."
+  else
+    row "XFRM errors" "none during the test"
+  fi
+  if [[ $ENGINE == rathole ]]; then
+    rhc=$(rh_conn_count)
+    row "Rathole" "service $(systemctl is-active "$RH_UNIT" 2>/dev/null), connections on ${IP_IRAN}:${RH_PORT}: ${rhc}"
+  fi
+  echo
+
+  if [[ -n $loss ]] && (( loss == 0 )); then
+    echo "${C_G}Verdict: the tunnel works (0% packet loss).${C_0}"
+    if [[ $ENGINE == rathole ]] && ( ! systemctl is-active --quiet "$RH_UNIT" 2>/dev/null || (( rhc == 0 )) ); then
+      warn "...but the rathole reverse tunnel is not connected: journalctl -u ${RH_UNIT} -n 30 --no-pager"
+    fi
+    return
+  fi
+
+  if [[ $dev != "$IF_NAME" ]]; then
+    cause="Traffic to ${PEER_INNER} does not use ${IF_NAME} (it goes via '${dev:-nothing}'). Another interface or route owns 10.10.10.0/24 - remove it (ip -4 addr / ip -4 route), then restart the tunnel."
+  elif (( n_pol < 3 || n_sa < 4 )); then
+    cause="The kernel state is incomplete (policies ${n_pol}/3, SAs ${n_sa}/4). Restart the tunnel (menu 7); if it stays incomplete read: journalctl -u ${APP} -n 50 --no-pager"
+  elif (( d_out == 0 )); then
+    cause="Nothing is being encrypted - the pings never enter the tunnel. See the XFRM errors above and the service log (journalctl -u ${APP} -n 50 --no-pager)."
+  elif (( have_probe && pr_ok == 0 )); then
+    cause="UDP ${UDP_PORT} gets no answer from ${PEER_PUB}. Either the other server is not installed/running yet, or UDP ${UDP_PORT} is blocked (provider/cloud firewall, or filtering between Iran and abroad). Open UDP ${UDP_PORT} on BOTH servers; if it still fails change the port with menu 12 (for example 443, 8443, 53 or a random high port)."
+  elif (( skew_abs >= 3300 )); then
+    cause="The two clocks differ by about ${pr_skew}s. Keys rotate hourly from the UTC clock and both sides must agree within well under 1 hour. Use menu 13 on the server with the wrong time."
+  elif (( d_rx == 0 && d_in == 0 )); then
+    if [[ $MODE == udp ]]; then
+      if (( have_probe )); then
+        cause="Probes pass but no tunnel packets arrive from the peer. The other side is not sending (service stopped, other port/transport - compare menu 3 on both) or the network drops ESP-looking UDP: run this diagnosis on the OTHER server, and if its 'ESP sent' is > 0 change the UDP port (menu 12)."
+      else
+        cause="No packets from the peer arrive. Run this diagnosis on the OTHER server: if its 'ESP sent' is > 0 the network drops them - open UDP ${UDP_PORT} in the cloud firewalls or change the port (menu 12)."
+      fi
+    else
+      cause="No ESP (IP protocol 50) packets arrive from the peer. The network between the servers most likely drops protocol 50 - switch both sides to ESP-in-UDP (menu 12)."
+    fi
+  elif (( d_in == 0 )); then
+    cause="Packets arrive from the peer but cannot be decrypted: key mismatch (Kharej was set up from a token of a different Iran install), clocks >= 1 hour apart (menu 13), or one side uses raw ESP and the other ESP-in-UDP. Re-copy the token (Iran menu 8 -> Kharej option 2)."
+  else
+    cause="Packets are decrypted but the ping still fails: a local firewall or sysctl (rp_filter / icmp_echo_ignore_all) is dropping traffic on ${IF_NAME}. Check: iptables -S | head -30 ; nft list ruleset | head -60"
+  fi
+  echo "${C_R}Verdict: no working link (${loss:-?}% packet loss).${C_0}"
+  echo "Most likely cause:"
+  echo "  ${cause}"
+  echo
+  echo "Tip: run this diagnosis on BOTH servers at the same time and compare 'ESP sent' with 'Peer -> here'."
+}
+
+sync_clock() {
+  local src hdr="" d=""
+  clock_status
+  echo "Both servers must show the same UTC time: keys rotate hourly from the clock, so a difference"
+  echo "of about an hour or more breaks the tunnel silently (NTP is often blocked in Iran)."
+  have curl || { err "curl is required."; return 1; }
+  for src in https://www.cloudflare.com https://www.google.com https://www.microsoft.com http://www.baidu.com; do
+    hdr=$(curl -sI --max-time 6 "$src" 2>/dev/null | tr -d '\r' | awk -F': ' 'tolower($1)=="date"{print $2; exit}')
+    if [[ -n $hdr ]]; then d=$hdr; break; fi
+  done
+  [[ -n $d ]] || { err "Could not read the time from the internet (no HTTP Date header received)."; return 1; }
+  echo "Internet time : $d"
+  confirm "Set the system clock to this time?" y || return 0
+  if date -u -s "$d" >/dev/null 2>&1; then
+    have hwclock && hwclock --systohc 2>/dev/null
+    ok "Clock set: $(date -u '+%F %T') UTC"
+    if load_config 2>/dev/null && systemctl is-active --quiet "$APP" 2>/dev/null; then
+      systemctl restart "$APP" && ok "Tunnel restarted so the keys are derived from the new time."
+    fi
+  else
+    err "Could not set the clock."
+    return 1
+  fi
+}
+
+# ------------------------------------------------------------------------------
 #  Menu actions
 # ------------------------------------------------------------------------------
 setup_iran() {
@@ -1281,9 +1565,10 @@ setup_iran() {
   info "Setting up the IRAN server side (tunnel IP ${IP_IRAN}, rathole server)"
   ENGINE=rathole; RH_PORT=$DEFAULT_RH_PORT; RH_TARGET=127.0.0.1
   ask_transport
-  ensure_deps    || { pause; return; }
-  check_kernel   || { pause; return; }
-  ensure_rathole || { pause; return; }
+  ensure_deps     || { pause; return; }
+  preflight_check || { pause; return; }
+  check_kernel    || { pause; return; }
+  ensure_rathole  || { pause; return; }
   cron_warn
 
   det=$(detect_public_ip)
@@ -1324,12 +1609,13 @@ setup_iran() {
     warn "ufw is active here: allow the forwarded ports too (ufw allow <port>)."
   fi
   fw_hint
+  echo "Next: set up the Kharej side, then run option 11 (Diagnose) on both servers if ping ${PEER_INNER} does not work."
   echo
   pause
 }
 
 setup_kharej() {
-  local tok pout ploss
+  local tok
   confirm_reinstall || return
   install_self || { pause; return; }
 
@@ -1341,8 +1627,9 @@ setup_kharej() {
     err "Invalid token (copy error?). Copy it again from the Iran server (menu option 8)."
   done
   MODE=$T_MODE; ENGINE=$T_ENGINE; RH_PORT=$T_RHPORT; RH_TARGET=127.0.0.1
-  ensure_deps  || { pause; return; }
-  check_kernel || { pause; return; }
+  ensure_deps     || { pause; return; }
+  preflight_check || { pause; return; }
+  check_kernel    || { pause; return; }
   if [[ $ENGINE == rathole ]]; then
     ensure_rathole || { pause; return; }
   fi
@@ -1365,30 +1652,28 @@ setup_kharej() {
   start_service || { pause; return; }
 
   echo
-  info "Testing the tunnel (5 pings to ${PEER_INNER})..."
-  pout=$(ping -c 5 -i 0.3 -W 1 -I "$IF_NAME" "$PEER_INNER" 2>&1)
-  tail -n 3 <<< "$pout"
-  ploss=$(grep -oE '[0-9]+% packet loss' <<< "$pout" | grep -oE '^[0-9]+')
-  if [[ $ploss == 100 ]]; then
-    if [[ $MODE == udp ]]; then
-      warn "No answer from ${PEER_INNER}. Check that the Iran side is running and UDP ${UDP_PORT} is open in BOTH servers' external firewalls."
-    else
-      warn "No answer from ${PEER_INNER}. If the Iran side is running, the network may be dropping protocol 50:"
-      warn "re-install BOTH sides choosing transport 2 (ESP-in-UDP)."
+  info "Waiting for the tunnel to come up (up to 20 s)..."
+  if wait_link 20; then
+    ok "Tunnel is UP - ${PEER_INNER} answers ping."
+    if [[ $ENGINE == rathole ]]; then
+      info "Waiting for the rathole reverse tunnel (${IP_KHAREJ} -> ${IP_IRAN}:${RH_PORT})..."
+      for _ in $(seq 1 12); do
+        (( $(rh_conn_count) >= 1 )) && break
+        sleep 1
+      done
+      if (( $(rh_conn_count) >= 1 )); then
+        ok "Reverse tunnel is connected."
+      else
+        warn "Not connected yet. See: journalctl -u ${RH_UNIT} -n 30 --no-pager"
+      fi
     fi
+  else
+    warn "No answer from ${PEER_INNER} yet - running the diagnosis..."
+    echo
+    diagnose
   fi
   echo
   if [[ $ENGINE == rathole ]]; then
-    info "Waiting for the rathole reverse tunnel (${IP_KHAREJ} -> ${IP_IRAN}:${RH_PORT})..."
-    for _ in $(seq 1 12); do
-      (( $(rh_conn_count) >= 1 )) && break
-      sleep 1
-    done
-    if (( $(rh_conn_count) >= 1 )); then
-      ok "Reverse tunnel is connected."
-    else
-      warn "Not connected yet. Is the Iran side installed and running? See: journalctl -u ${RH_UNIT} -n 30 --no-pager"
-    fi
     echo "Ports [${PORTS}] (${FWD_PROTO}) opened on the Iran server are forwarded to ${RH_TARGET}:<same port> on THIS server."
     echo "The services must be running here and listening on ${RH_TARGET} (or 0.0.0.0)."
   else
@@ -1416,6 +1701,7 @@ cmd_status() {
   if [[ $MODE == udp ]]; then echo "Transport     : ESP-in-UDP, port $UDP_PORT"
   else echo "Transport     : raw ESP (IP protocol 50)"; fi
   echo "Cipher        : AES-256-GCM, MTU $MTU, next key rotation in $((left / 60)) min (epoch $epoch)"
+  clock_status
   echo "Watchdog      : rx-stall trigger ${RX_STALL_SEC}s, preventive rebuild $( (( FORCE_REBUILD_SEC > 0 )) && echo "every $((FORCE_REBUILD_SEC/3600))h" || echo disabled)"
   if [[ $st == active ]]; then echo "Service       : ${C_G}active${C_0}"; else echo "Service       : ${C_R}${st}${C_0}"; fi
   if [[ $ENGINE == rathole ]]; then
@@ -1435,14 +1721,15 @@ cmd_status() {
     echo "Interface     : ${C_R}$IF_NAME missing${C_0}"
   fi
   echo "Loaded SAs    : $(wc -l < "$REG" 2>/dev/null || echo 0)  (1 outbound + 3 inbound expected)"
+  echo "From the peer : $(outer_rx_count) transport packets accepted by the firewall since the rules were loaded"
   echo
   echo "--- Ping through the tunnel (10 packets) ---"
-  ping -c 10 -i 0.2 -W 1 -I "$IF_NAME" "$PEER_INNER" 2>&1 | tail -n 2
+  LC_ALL=C ping -c 10 -i 0.2 -W 1 -I "$IF_NAME" "$PEER_INNER" 2>&1 | tail -n 2
   echo
   echo "--- Interface counters ---"
   ip -s link show "$IF_NAME" 2>/dev/null | sed -n '3,6p'
   echo
-  line=$(awk '$2 != 0 {printf "%s=%s ", $1, $2}' /proc/net/xfrm_stat 2>/dev/null)
+  line=$(xfrm_nonzero_counters)
   if [[ -n $line ]]; then
     echo "XFRM counters (non-zero = drops/errors): $line"
   else
@@ -1462,7 +1749,7 @@ cmd_status() {
     iptables -t nat -vnL ESPT_PRE 2>/dev/null | sed -n '2,$p'
   fi
   echo
-  echo "Tip: check raw ESP on the wire:  tcpdump -ni $WAN_DEV 'ip proto 50'"
+  echo "No ping? Run menu 11 (Diagnose) on both servers.   Raw ESP on the wire: tcpdump -ni $WAN_DEV 'ip proto 50'"
 }
 
 live_counters() {
@@ -1484,48 +1771,6 @@ live_counters() {
   trap - INT
 }
 
-health_check() {
-  local out loss line x rhc=0 rh_note="" pk_out=0 pk_in=0
-  echo "Running health check (~3s of pings)..."
-  out=$(ping -c 10 -i 0.3 -W 1 -I "$IF_NAME" "$PEER_INNER" 2>&1)
-  echo "$out" | tail -n 3
-  loss=$(grep -oE '[0-9]+% packet loss' <<< "$out" | grep -oE '^[0-9]+')
-  echo
-  echo "Interface    : $(ip -br link show "$IF_NAME" 2>/dev/null || echo "${IF_NAME} missing")"
-  x=$(xfrm_nonzero_counters)
-  echo "XFRM errors  : ${x:-none (clean)}"
-  echo "SAs loaded   : $(wc -l < "$REG" 2>/dev/null || echo 0) (expect 4: 1 outbound + 3 inbound)"
-  read -r pk_out pk_in <<< "$(xfrm_pkt_counts)"
-  echo "ESP packets  : sent ${pk_out:-0}, received+decrypted ${pk_in:-0}  (since the current SAs were created)"
-  if [[ $ENGINE == rathole ]]; then
-    rhc=$(rh_conn_count)
-    echo "Rathole      : service $(systemctl is-active "$RH_UNIT" 2>/dev/null), connections on ${IP_IRAN}:${RH_PORT}: ${rhc}"
-    if ! systemctl is-active --quiet "$RH_UNIT" 2>/dev/null || (( rhc == 0 )); then
-      rh_note=" - but the rathole reverse tunnel is NOT connected"
-    fi
-  fi
-  echo
-  if [[ -z $loss ]]; then
-    echo "${C_R}Verdict: could not measure (ping did not run)${C_0}"
-  elif (( loss == 0 )) && [[ -z $x ]]; then
-    if [[ -n $rh_note ]]; then
-      echo "${C_Y}Verdict: ESP link healthy (0% loss, no xfrm errors)${rh_note}${C_0}"
-    else
-      echo "${C_G}Verdict: healthy (0% loss, no xfrm errors)${C_0}"
-    fi
-  elif (( loss < 50 )); then
-    echo "${C_Y}Verdict: degraded (${loss}% loss)${rh_note}${C_0}"
-  else
-    echo "${C_R}Verdict: down / severely degraded (${loss}% loss)${C_0}"
-  fi
-  if [[ -n $loss ]] && (( loss >= 50 )); then
-    echo
-    echo "Hint: run this check on BOTH servers. If 'sent' keeps growing on one side while the OTHER side's"
-    echo "      'received' stays at 0, the network drops the tunnel packets in that direction. Rebuilding cannot fix"
-    echo "      that - re-install both sides with transport 2 (ESP-in-UDP) and make sure UDP ${UDP_PORT} is open."
-  fi
-}
-
 live_log() {
   local c
   if ! load_config 2>/dev/null; then warn "Tunnel is not installed."; return; fi
@@ -1534,14 +1779,14 @@ live_log() {
   echo "  1) Service log (events, key rotations, up/down, forensic snapshots)"
   echo "  2) Live ping monitor (packet loss + latency/jitter through the tunnel)"
   echo "  3) Live traffic counters (kbit/s, pps, errors)"
-  echo "  4) Run health check now"
+  echo "  4) Diagnose connection now (same as menu 11)"
   echo "  5) Rathole log (reverse tunnel)"
   read -r -p "Select [1]: " c
   case ${c:-1} in
     1) echo "(Ctrl+C to return)"; trap ':' INT; journalctl -u "$APP" -f -n 40 --no-pager; trap - INT ;;
     2) echo "(Ctrl+C to stop and see the summary)"; trap ':' INT; ping -O -i 0.5 -I "$IF_NAME" "$PEER_INNER"; trap - INT ;;
     3) live_counters ;;
-    4) health_check; pause ;;
+    4) diagnose; pause ;;
     5) if [[ $ENGINE == rathole ]]; then
          echo "(Ctrl+C to return)"; trap ':' INT; journalctl -u "$RH_UNIT" -f -n 40 --no-pager; trap - INT
        else
@@ -1604,6 +1849,47 @@ change_ports() {
     write_config
     rh_write_config || return
     systemctl restart "$RH_UNIT" && ok "Rathole client restarted."
+  fi
+}
+
+# Change transport (raw ESP <-> ESP-in-UDP) or the UDP port on an installed tunnel.
+# Iran: choose, get a new token. Kharej: paste that token. No re-install, same key.
+change_transport() {
+  local tok old_port
+  load_config 2>/dev/null || { warn "Tunnel is not installed."; return; }
+  old_port=$UDP_PORT
+
+  if [[ $ROLE == iran ]]; then
+    info "Current transport: $( [[ $MODE == udp ]] && echo "ESP-in-UDP, port $UDP_PORT" || echo "raw ESP (IP protocol 50)" )"
+    ask_transport
+    if [[ $MODE == udp && $ENGINE == rathole ]] && ports_include "$PORTS" "$UDP_PORT"; then
+      err "UDP port $UDP_PORT is in the forwarded port list - choose another transport port (nothing was changed)."
+      return
+    fi
+    if [[ $MODE == udp && $UDP_PORT != "$old_port" && -n $(ss -Hlun "sport = :${UDP_PORT}" 2>/dev/null) ]]; then
+      err "UDP port $UDP_PORT is already in use on this server (nothing was changed)."
+      return
+    fi
+    ensure_deps || return
+    write_config
+    load_config
+    systemctl restart "$APP" && ok "Tunnel restarted with the new transport."
+    print_token
+    warn "Kharej server: run this option (12) and paste the token above. The link stays down until both sides match."
+    fw_hint
+  else
+    echo "Paste the NEW token shown by the Iran server after it changed the transport (Iran: menu 12 or 8)."
+    read -r -p "Token: " tok
+    parse_token "$tok" || { err "Invalid token."; return; }
+    [[ $T_MASTER == "$MASTER" ]] || { err "That token belongs to a different tunnel (key mismatch)."; return; }
+    MODE=$T_MODE; UDP_PORT=$T_UDP; PORTS=$(norm_ports "$T_PORTS"); FWD_PROTO=$T_PROTO
+    ensure_deps || return
+    write_config
+    load_config
+    restart_tunnel
+    info "Waiting for the tunnel (up to 20 s)..."
+    if wait_link 20; then ok "Tunnel is UP - ${PEER_INNER} answers ping."; else warn "No answer yet - running the diagnosis..."; diagnose; fi
+    fw_hint
   fi
 }
 
@@ -1675,6 +1961,9 @@ menu() {
     echo "  8) Show token (Iran)"
     echo "  9) Watchdog / preventive-rebuild settings"
     echo " 10) Update rathole core"
+    echo " 11) Diagnose connection (why no ping?)"
+    echo " 12) Change transport / UDP port (Iran first, then Kharej)"
+    echo " 13) Sync system clock (keys depend on it)"
     echo "  0) Exit"
     echo
     read -r -p "Select: " ch || exit 0
@@ -1690,6 +1979,9 @@ menu() {
       8) show_token; echo; pause ;;
       9) change_watchdog; echo; pause ;;
       10) update_rathole; echo; pause ;;
+      11) diagnose; echo; pause ;;
+      12) change_transport; echo; pause ;;
+      13) sync_clock; echo; pause ;;
       0|q|Q) exit 0 ;;
       *) warn "Invalid choice."; sleep 1 ;;
     esac
@@ -1697,13 +1989,14 @@ menu() {
 }
 
 usage() {
-  echo "Usage: $0 [menu|status|daemon|teardown|fw|rh-run]"
+  echo "Usage: $0 [menu|status|diag|daemon|teardown|fw|rh-run]"
 }
 
 main() {
   case "${1:-menu}" in
     menu)     need_root; menu ;;
     status)   need_root; cmd_status ;;
+    diag)     need_root; diagnose ;;
     daemon)   need_root; cmd_daemon ;;
     rh-run)   need_root; cmd_rh_run ;;
     teardown) need_root; cmd_teardown ;;
