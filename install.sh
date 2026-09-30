@@ -33,6 +33,18 @@
 #   * Installs done by older versions (iptables DNAT) keep working unchanged
 #     until you re-install (engine "dnat").
 #
+#  v2.1 fixes
+#   * Transport prompt now defaults to ESP-in-UDP (raw protocol 50 is dropped by some
+#     providers/ISPs - typically the tunnel then works for a few seconds or only in one
+#     direction). Raw ESP is still option 1.
+#   * Watchdog back-off: rebuilds that do not bring the link back no longer repeat every
+#     minute (2 min, 4 min, ... up to 15 min) and the log says why. A rebuild cannot fix a
+#     network that drops the packets.
+#   * Health check shows ESP packets sent / received per side and explains one-way loss.
+#   * rathole.toml is written atomically (no half-written file seen by rathole's watcher).
+#   * Warns about leftover cron jobs that mention esp-tunnel (they fight the watchdog).
+#   * The rathole port list may no longer contain the ESP-in-UDP port.
+#
 #  v1.1 watchdog (unchanged)
 #   * asymmetric-blackout detector (TX moving, RX frozen) -> early rebuild
 #   * xfrm error counters polled every cycle, forensic snapshot before rebuilds
@@ -44,7 +56,7 @@
 # ==============================================================================
 
 APP="esp-tunnel"
-VERSION="2.0"
+VERSION="2.1"
 BIN="/usr/local/bin/${APP}"
 CONF_DIR="/etc/${APP}"
 CONF="${CONF_DIR}/config"
@@ -90,6 +102,7 @@ ENGINE=""; RH_PORT="$DEFAULT_RH_PORT"; RH_TARGET="127.0.0.1"; RH_AUTH=""
 
 # ---- daemon watchdog state (globals; meaningful only while cmd_daemon runs) --
 RX0=0; TX0=0; RX_STALL_START=0; LAST_REBUILD=0; FAILS=0; PEER_STATE="unknown"; XPREV=""
+REB_N=0; BACKOFF_UNTIL=0; UP_SINCE=0
 
 PY_UDP='
 import socket, sys
@@ -794,9 +807,9 @@ EOF
           done
         done
       fi
-    } > "$RH_CONF"
+    } > "${RH_CONF}.new"
   )
-  chmod 600 "$RH_CONF"
+  chmod 600 "${RH_CONF}.new" && mv -f "${RH_CONF}.new" "$RH_CONF"
 }
 
 write_rh_unit() {
@@ -894,6 +907,15 @@ if_counters() {   # prints "<rx_bytes> <tx_bytes>" for $IF_NAME
   echo "${r:-0} ${t:-0}"
 }
 
+# "<packets sent> <packets received+decrypted>" summed over this tunnel's loaded SAs
+xfrm_pkt_counts() {
+  route_info "$PEER_PUB" >/dev/null 2>&1
+  ip -s xfrm state 2>/dev/null | awk -v la="$LOCAL_ADDR" -v pa="$PEER_PUB" '
+    $1 == "src" { cur = ""; if ($2 == la && $4 == pa) cur = "out"; else if ($2 == pa && $4 == la) cur = "in"; next }
+    /lifetime current:/ { getline; if (cur != "" && match($0, /[0-9]+\(packets\)/)) s[cur] += substr($0, RSTART, RLENGTH - 9); next }
+    END { printf "%d %d\n", s["out"], s["in"] }'
+}
+
 xfrm_nonzero_counters() {   # e.g. "XfrmInStateProtoError=3 XfrmInTmplMismatch=1"
   awk '$2 != 0 {printf "%s=%s ", $1, $2}' /proc/net/xfrm_stat 2>/dev/null
 }
@@ -924,7 +946,7 @@ forensic_snapshot() {
 # forensic dump), tears down + rebuilds, and resets all watchdog counters so
 # the freshly-rebuilt tunnel gets a clean slate.
 watchdog_rebuild() {   # watchdog_rebuild "<reason>" [skip-forensic]
-  local reason=$1
+  local reason=$1 back
   if [[ ${2:-} == skip-forensic ]]; then
     log "$reason"
   else
@@ -937,6 +959,20 @@ watchdog_rebuild() {   # watchdog_rebuild "<reason>" [skip-forensic]
     log "ERROR: rebuild attempt failed, will retry next cycle"
   fi
   LAST_REBUILD=$(date +%s)
+  UP_SINCE=0
+  # unscheduled rebuilds that do not bring the link back: back off instead of repeating every minute
+  if [[ ${2:-} != skip-forensic ]]; then
+    REB_N=$(( REB_N + 1 ))
+    if (( REB_N >= 3 )); then
+      back=$(( 120 * (REB_N - 2) )); (( back > 900 )) && back=900
+      BACKOFF_UNTIL=$(( LAST_REBUILD + back ))
+      log "WARN: ${REB_N} rebuilds in a row did not bring the link back - next automatic rebuild in ${back}s at the earliest"
+      if (( REB_N == 3 )); then
+        log "HINT: a rebuild cannot fix a network that drops the packets. Run the health check (Live Log -> 4) on BOTH servers;"
+        log "HINT: if one side sends ESP but the other receives none, re-install both sides with transport 2 (ESP-in-UDP)."
+      fi
+    fi
+  fi
   RX_STALL_START=0
   FAILS=0
   PEER_STATE="unknown"
@@ -998,7 +1034,7 @@ cmd_daemon() {
     read -r rx tx <<< "$(if_counters)"
     if (( tx > TX0 && rx == RX0 )); then
       (( RX_STALL_START == 0 )) && RX_STALL_START=$now
-      if (( now - RX_STALL_START >= RX_STALL_SEC )); then
+      if (( now - RX_STALL_START >= RX_STALL_SEC && now >= BACKOFF_UNTIL )); then
         watchdog_rebuild "asymmetric blackout: no inbound traffic for ${RX_STALL_SEC}s while outbound is active"
         continue
       fi
@@ -1010,11 +1046,14 @@ cmd_daemon() {
     if ping -c1 -W1 -I "$IF_NAME" "$PEER_INNER" >/dev/null 2>&1; then
       if [[ $PEER_STATE != up ]]; then log "peer $PEER_INNER reachable - tunnel UP"; fi
       PEER_STATE=up; FAILS=0
+      (( UP_SINCE == 0 )) && UP_SINCE=$now
+      if (( now - UP_SINCE >= 120 )); then REB_N=0; BACKOFF_UNTIL=0; fi   # stable for 2 min: forget past failures
     else
+      UP_SINCE=0
       FAILS=$(( FAILS + 1 ))
       if (( FAILS == 3 )); then PEER_STATE=down; log "peer $PEER_INNER not answering for ~15s"; fi
       if (( FAILS >= 12 )); then
-        if (( now - last_fix >= 180 )); then
+        if (( now - last_fix >= 180 && now >= BACKOFF_UNTIL )); then
           last_fix=$now
           watchdog_rebuild "peer unreachable (ping) for 60s+"
         fi
@@ -1122,6 +1161,10 @@ ask_ports() {
         err "Port $RH_PORT is reserved for the rathole control channel. Remove it."
         continue
       fi
+      if [[ $MODE == udp ]] && ports_include "$norm" "$UDP_PORT"; then
+        err "Port $UDP_PORT is used by the ESP-in-UDP transport itself. Remove it from the list."
+        continue
+      fi
       busy=$(busy_ports "$norm")
       if [[ -n $busy ]]; then
         err "Already used by a local service on this server: ${busy}- rathole could not open them. Free them or choose other ports."
@@ -1146,10 +1189,14 @@ ask_transport() {
   local c
   echo
   echo "Transport:"
-  echo "  1) Raw ESP - IP protocol 50   (default: fastest, smallest overhead)"
-  echo "  2) ESP-in-UDP                 (fallback: use it if protocol 50 is blocked or a NAT is in front of a server)"
-  read -r -p "Select [1]: " c
-  if [[ $c == 2 ]]; then
+  echo "  1) Raw ESP - IP protocol 50   (fastest, smallest overhead - but some providers/ISPs drop protocol 50:"
+  echo "                                 the tunnel then never comes up, or works only for a few seconds / one way)"
+  echo "  2) ESP-in-UDP                 (recommended between Iran and abroad: looks like ordinary UDP, survives NAT)"
+  read -r -p "Select [2]: " c
+  if [[ ${c:-2} == 1 ]]; then
+    MODE=esp
+    UDP_PORT=$DEFAULT_UDP_PORT
+  else
     MODE=udp
     while true; do
       read -r -p "UDP port for ESP-in-UDP [${DEFAULT_UDP_PORT}]: " UDP_PORT
@@ -1157,9 +1204,7 @@ ask_transport() {
       valid_port "$UDP_PORT" && break
       err "Invalid port."
     done
-  else
-    MODE=esp
-    UDP_PORT=$DEFAULT_UDP_PORT
+    echo "Remember: UDP ${UDP_PORT} must be open in BOTH servers' external/cloud firewalls."
   fi
 }
 
@@ -1190,6 +1235,29 @@ ask_rh_target() {
   done
 }
 
+fw_hint() {
+  if [[ $MODE == udp ]]; then
+    echo "Open UDP ${UDP_PORT} (in and out) in your provider's external / cloud firewall if it has one."
+  else
+    echo "Open IP protocol 50 (ESP) in your provider's external / cloud firewall if it has one."
+  fi
+}
+
+# leftover cron jobs that restart the tunnel fight the built-in watchdog
+cron_warn() {
+  local f found=""
+  for f in /etc/crontab /etc/cron.d /etc/cron.hourly /etc/cron.daily /var/spool/cron /var/spool/cron/crontabs; do
+    [[ -e $f ]] || continue
+    found+="$(grep -rIl -e "$APP" -- "$f" 2>/dev/null)"$'\n'
+  done
+  found=$(sed '/^$/d' <<< "$found" | sort -u)
+  if [[ -n $found ]]; then
+    warn "Cron jobs that mention ${APP} exist - a job that restarts the tunnel fights the built-in watchdog:"
+    sed 's/^/      /' <<< "$found" >&2
+    warn "Remove them unless you know you need them."
+  fi
+}
+
 print_token() {
   local tok
   tok=$(make_token)
@@ -1216,6 +1284,7 @@ setup_iran() {
   ensure_deps    || { pause; return; }
   check_kernel   || { pause; return; }
   ensure_rathole || { pause; return; }
+  cron_warn
 
   det=$(detect_public_ip)
   while true; do
@@ -1254,13 +1323,13 @@ setup_iran() {
   if have ufw && ufw status 2>/dev/null | grep -qi '^Status: active'; then
     warn "ufw is active here: allow the forwarded ports too (ufw allow <port>)."
   fi
-  echo "Open the ESP protocol (IP proto 50$( [[ $MODE == udp ]] && echo ", UDP ${UDP_PORT}" )) in your provider's external firewall if it has one."
+  fw_hint
   echo
   pause
 }
 
 setup_kharej() {
-  local tok
+  local tok pout ploss
   confirm_reinstall || return
   install_self || { pause; return; }
 
@@ -1277,6 +1346,7 @@ setup_kharej() {
   if [[ $ENGINE == rathole ]]; then
     ensure_rathole || { pause; return; }
   fi
+  cron_warn
 
   IRAN_IP=$T_IRAN; KHAREJ_IP=$T_KHAREJ; UDP_PORT=$T_UDP
   PORTS=$(norm_ports "$T_PORTS"); FWD_PROTO=$T_PROTO; MASTER=$T_MASTER; ROLE=kharej
@@ -1296,7 +1366,17 @@ setup_kharej() {
 
   echo
   info "Testing the tunnel (5 pings to ${PEER_INNER})..."
-  ping -c 5 -i 0.3 -W 1 -I "$IF_NAME" "$PEER_INNER" 2>&1 | tail -n 3
+  pout=$(ping -c 5 -i 0.3 -W 1 -I "$IF_NAME" "$PEER_INNER" 2>&1)
+  tail -n 3 <<< "$pout"
+  ploss=$(grep -oE '[0-9]+% packet loss' <<< "$pout" | grep -oE '^[0-9]+')
+  if [[ $ploss == 100 ]]; then
+    if [[ $MODE == udp ]]; then
+      warn "No answer from ${PEER_INNER}. Check that the Iran side is running and UDP ${UDP_PORT} is open in BOTH servers' external firewalls."
+    else
+      warn "No answer from ${PEER_INNER}. If the Iran side is running, the network may be dropping protocol 50:"
+      warn "re-install BOTH sides choosing transport 2 (ESP-in-UDP)."
+    fi
+  fi
   echo
   if [[ $ENGINE == rathole ]]; then
     info "Waiting for the rathole reverse tunnel (${IP_KHAREJ} -> ${IP_IRAN}:${RH_PORT})..."
@@ -1315,7 +1395,7 @@ setup_kharej() {
     echo "Services for ports [${PORTS}] on this server must listen on 0.0.0.0 or ${IP_KHAREJ}."
     echo "Traffic arrives from ${IP_IRAN} (the Iran server's tunnel IP)."
   fi
-  echo "Open the ESP protocol (IP proto 50$( [[ $MODE == udp ]] && echo ", UDP ${UDP_PORT}" )) in your provider's external firewall if it has one."
+  fw_hint
   echo
   pause
 }
@@ -1405,7 +1485,7 @@ live_counters() {
 }
 
 health_check() {
-  local out loss line x rhc=0 rh_note=""
+  local out loss line x rhc=0 rh_note="" pk_out=0 pk_in=0
   echo "Running health check (~3s of pings)..."
   out=$(ping -c 10 -i 0.3 -W 1 -I "$IF_NAME" "$PEER_INNER" 2>&1)
   echo "$out" | tail -n 3
@@ -1415,6 +1495,8 @@ health_check() {
   x=$(xfrm_nonzero_counters)
   echo "XFRM errors  : ${x:-none (clean)}"
   echo "SAs loaded   : $(wc -l < "$REG" 2>/dev/null || echo 0) (expect 4: 1 outbound + 3 inbound)"
+  read -r pk_out pk_in <<< "$(xfrm_pkt_counts)"
+  echo "ESP packets  : sent ${pk_out:-0}, received+decrypted ${pk_in:-0}  (since the current SAs were created)"
   if [[ $ENGINE == rathole ]]; then
     rhc=$(rh_conn_count)
     echo "Rathole      : service $(systemctl is-active "$RH_UNIT" 2>/dev/null), connections on ${IP_IRAN}:${RH_PORT}: ${rhc}"
@@ -1435,6 +1517,12 @@ health_check() {
     echo "${C_Y}Verdict: degraded (${loss}% loss)${rh_note}${C_0}"
   else
     echo "${C_R}Verdict: down / severely degraded (${loss}% loss)${C_0}"
+  fi
+  if [[ -n $loss ]] && (( loss >= 50 )); then
+    echo
+    echo "Hint: run this check on BOTH servers. If 'sent' keeps growing on one side while the OTHER side's"
+    echo "      'received' stays at 0, the network drops the tunnel packets in that direction. Rebuilding cannot fix"
+    echo "      that - re-install both sides with transport 2 (ESP-in-UDP) and make sure UDP ${UDP_PORT} is open."
   fi
 }
 
