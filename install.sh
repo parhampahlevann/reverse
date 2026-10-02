@@ -19,6 +19,19 @@
 #     The Backhaul transport is chosen during the install on the Iran server:
 #     tcp / tcpmux / udp / ws / wss / wsmux / wssmux (it travels inside the token).
 #
+#  v2.5 - IPv6 between the servers + the Kharej side asks for the Iran server IP
+#   * The connection between the two servers (the outer ESP / ESP-in-UDP packets) can now run over
+#     IPv4 OR IPv6. The Iran install asks which one; the Kharej side follows the token. Both
+#     servers must use the same IP version (one tunnel = one version). The tunnel addresses inside
+#     (10.10.10.1 / 10.10.10.2) and the Backhaul reverse tunnel are unchanged.
+#   * IPv6 needs: a working public IPv6 address + route on both servers, ip6tables, and for the
+#     ESP-in-UDP transport Linux >= 5.8 (raw ESP over IPv6 works on older kernels too).
+#     Link-local (fe80::) addresses are not supported.
+#   * The Kharej install now ASKS for the Iran server IP (IPv4 or IPv6; Enter = the value from the token).
+#   * NEW menu 15: change the server IPs / switch IPv4 <-> IPv6 later (Iran first, then Kharej).
+#   * Firewall: ip6tables chain ESPT_IN6 for the outer IPv6 packets (restored by the watchdog too);
+#     UDP helper, UDP probe and path-MTU probe are IPv6-aware; MTU accounts for the 40-byte IPv6 header.
+#
 #  v2.4 - Backhaul core instead of Rathole
 #   * The reverse tunnel inside the ESP tunnel is now Backhaul. The core is downloaded from the
 #     official release (backhaul_linux_<arch>.tar.gz); a local file / mirror URL is accepted too.
@@ -78,7 +91,7 @@
 # ==============================================================================
 
 APP="esp-tunnel"
-VERSION="2.4"
+VERSION="2.5"
 BIN="/usr/local/bin/${APP}"
 CONF_DIR="/etc/${APP}"
 CONF="${CONF_DIR}/config"
@@ -125,6 +138,7 @@ LOCAL_ADDR=""; WAN_DEV=""; CUR_EPOCH=0
 FORCE_REBUILD_SEC="$DEFAULT_FORCE_REBUILD_SEC"; RX_STALL_SEC="$DEFAULT_RX_STALL_SEC"
 ENGINE=""; BH_PORT="$DEFAULT_BH_PORT"; BH_TARGET="127.0.0.1"; BH_AUTH=""; BH_TRANSPORT="$DEFAULT_BH_TRANSPORT"
 MTU_SET=0; NET_TUNE=1            # MTU_SET 0 = automatic;  NET_TUNE 1 = BBR / buffer tuning on
+FAM=4                            # IP version of the outer (server <-> server) packets: 4 or 6
 
 # ---- daemon watchdog state (globals; meaningful only while cmd_daemon runs) --
 RX0=0; TX0=0; RX_STALL_START=0; LAST_REBUILD=0; FAILS=0; PEER_STATE="unknown"; XPREV=""
@@ -135,9 +149,15 @@ PREV_BYTES=0; PING_RX0=0; BASE_POL=0; BASE_SA=0; PM_BEST=0; PM_REC=0
 # with four zero bytes (the "non-ESP marker") to user space: those are used as clear-text probes.
 PY_UDP='
 import socket, sys, time
-port = int(sys.argv[1])
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.bind(("0.0.0.0", port))
+fam = int(sys.argv[1])
+port = int(sys.argv[2])
+if fam == 6:
+    s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+    s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+    s.bind(("::", port))
+else:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("0.0.0.0", port))
 s.setsockopt(socket.IPPROTO_UDP, 100, 2)   # UDP_ENCAP = UDP_ENCAP_ESPINUDP
 while True:
     try:
@@ -152,7 +172,7 @@ while True:
 PY_PROBE='
 import socket, sys, time, os
 host, port, n = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET, socket.SOCK_DGRAM)
 s.settimeout(1.0)
 ok = 0
 rtt = []
@@ -191,15 +211,19 @@ PY_PMTU='
 import socket, sys, os
 host, port = sys.argv[1], int(sys.argv[2])
 sizes = [int(x) for x in sys.argv[3:]]
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+v6 = ":" in host
+s = socket.socket(socket.AF_INET6 if v6 else socket.AF_INET, socket.SOCK_DGRAM)
 s.settimeout(0.8)
 try:
-    s.setsockopt(socket.IPPROTO_IP, 10, 2)   # IP_MTU_DISCOVER = IP_PMTUDISC_DO (sets DF)
+    if v6:
+        s.setsockopt(socket.IPPROTO_IPV6, 23, 2)   # IPV6_MTU_DISCOVER = IPV6_PMTUDISC_DO
+    else:
+        s.setsockopt(socket.IPPROTO_IP, 10, 2)     # IP_MTU_DISCOVER = IP_PMTUDISC_DO (sets DF)
 except Exception:
     pass
 best = 0
 for size in sizes:
-    pl = size - 28
+    pl = size - (48 if v6 else 28)
     if pl < 40:
         continue
     nonce = os.urandom(4).hex().encode()
@@ -266,6 +290,11 @@ valid_ip() {
 }
 
 is_private_ip() {
+  local a=${1,,}
+  if [[ $a == *:* ]]; then   # IPv6: loopback, link-local (fe80::/10), unique-local (fc00::/7)
+    [[ $a =~ ^(::1$|fe[89ab][0-9a-f]:|f[cd][0-9a-f]{2}:) ]]
+    return
+  fi
   [[ $1 =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|127\.|169\.254\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.) ]]
 }
 
@@ -274,6 +303,87 @@ valid_port() { [[ $1 =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); }
 valid_bh_transport() {
   case $1 in tcp|tcpmux|udp|ws|wss|wsmux|wssmux) return 0 ;; esac
   return 1
+}
+
+# ---- IPv6 text helpers (pure bash: no dependency, canonical form = what iproute2 / ip6tables print) ----
+# "2001:DB8:0:0::1" -> "2001 db8 0 0 0 0 0 1"  (8 groups, lowercase, no leading zeros); returns 1 if not an IPv6 address
+ip6_groups() {
+  local a=${1,,} head tail i
+  local -a h=() t=() g=() out=()
+  [[ $a =~ ^[0-9a-f:]+$ && $a == *:*:* && $a != *:::* ]] || return 1
+  if [[ $a == *::* ]]; then
+    [[ ${a#*::} != *::* ]] || return 1
+    head=${a%%::*}; tail=${a#*::}
+    [[ $head != :* && $head != *: && $tail != :* && $tail != *: ]] || return 1
+    [[ -z $head ]] || IFS=':' read -ra h <<< "$head"
+    [[ -z $tail ]] || IFS=':' read -ra t <<< "$tail"
+    (( ${#h[@]} + ${#t[@]} <= 7 )) || return 1
+    g=("${h[@]}")
+    for (( i = 0; i < 8 - ${#h[@]} - ${#t[@]}; i++ )); do g+=(0); done
+    g+=("${t[@]}")
+  else
+    [[ $a != :* && $a != *: ]] || return 1
+    IFS=':' read -ra g <<< "$a"
+    (( ${#g[@]} == 8 )) || return 1
+  fi
+  for i in "${g[@]}"; do
+    [[ $i =~ ^[0-9a-f]{1,4}$ ]] || return 1
+    out+=("$(printf '%x' $(( 16#$i )))")
+  done
+  echo "${out[*]}"
+}
+
+# canonical text form (RFC 5952): longest run of zero groups becomes "::"
+ip6_canon() {
+  local i bs=-1 bl=0 cs=-1 cl=0 left right
+  local -a g=()
+  read -ra g <<< "$(ip6_groups "$1")" || return 1
+  (( ${#g[@]} == 8 )) || return 1
+  for (( i = 0; i < 8; i++ )); do
+    if [[ ${g[i]} == 0 ]]; then
+      (( cl == 0 )) && cs=$i
+      cl=$(( cl + 1 ))
+      if (( cl > bl )); then bs=$cs; bl=$cl; fi
+    else
+      cl=0
+    fi
+  done
+  if (( bl >= 2 )); then
+    local IFS=:
+    left="${g[*]:0:bs}"; right="${g[*]:bs+bl}"
+    echo "${left}::${right}"
+  else
+    local IFS=:
+    echo "${g[*]}"
+  fi
+}
+
+# usable public peer address: link-local, multicast, :: and ::1 are refused
+valid_ip6() {
+  local c
+  c=$(ip6_canon "$1") || return 1
+  [[ $c != :: && $c != ::1 && ! $c =~ ^fe[89ab][0-9a-f]: && ! $c =~ ^ff[0-9a-f]{2}: ]]
+}
+
+valid_addr() { valid_ip "$1" || valid_ip6 "$1"; }                         # IPv4 or IPv6
+norm_addr()  { if [[ $1 == *:* ]]; then ip6_canon "$1"; else echo "$1"; fi; }
+addr_fam()   { if [[ $1 == *:* ]]; then echo 6; else echo 4; fi; }
+hp()         { if [[ $1 == *:* ]]; then echo "[$1]:$2"; else echo "$1:$2"; fi; }   # host:port text
+
+# ask_addr "<prompt>" "<default>" [4|6]  -> prints the canonical address (loops until valid; family optional)
+ask_addr() {
+  local a
+  while true; do
+    read -r -p "$1" a
+    a=${a:-$2}
+    if valid_addr "$a"; then
+      a=$(norm_addr "$a")
+      if [[ -z ${3:-} || $(addr_fam "$a") == "$3" ]]; then echo "$a"; return 0; fi
+      err "This is an IPv$(addr_fam "$a") address - an IPv${3} address is needed."
+      continue
+    fi
+    err "Invalid address (IPv4, or IPv6 without a link-local fe80:: address)."
+  done
 }
 
 # "1080, 443 ,8000-8100"  ->  "1080,443,8000-8100"   (returns 1 if invalid)
@@ -338,22 +448,29 @@ rand_hex() { head -c "$1" /dev/urandom | od -An -tx1 | tr -d ' \n'; }
 
 # Sets LOCAL_ADDR (our source address towards $1) and WAN_DEV
 route_info() {
-  local out
-  out=$(ip -4 route get "$1" 2>/dev/null | head -n1)
+  local out fl=-4
+  [[ $1 == *:* ]] && fl=-6
+  out=$(ip $fl route get "$1" 2>/dev/null | head -n1)
   LOCAL_ADDR=$(awk '{for(i=1;i<NF;i++) if($i=="src"){print $(i+1); exit}}' <<<"$out")
   WAN_DEV=$(awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}' <<<"$out")
   [[ -n $LOCAL_ADDR && -n $WAN_DEV ]]
 }
 
-detect_public_ip() {
-  local addr pub
-  addr=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="src"){print $(i+1); exit}}')
+detect_public_ip() {   # detect_public_ip [4|6]
+  local fam=${1:-4} addr pub probe=1.1.1.1 fl=-4 url=https://api.ipify.org
+  if [[ $fam == 6 ]]; then probe=2606:4700:4700::1111; fl=-6; url=https://api6.ipify.org; fi
+  addr=$(ip $fl route get "$probe" 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="src"){print $(i+1); exit}}')
   if [[ -z $addr ]] || is_private_ip "$addr"; then
     if have curl; then
-      pub=$(curl -4 -fsS --max-time 4 https://api.ipify.org 2>/dev/null)
-      valid_ip "$pub" && addr=$pub
+      pub=$(curl $fl -fsS --max-time 4 "$url" 2>/dev/null)
+      if [[ $fam == 6 ]]; then
+        valid_ip6 "$pub" && addr=$(ip6_canon "$pub")
+      else
+        valid_ip "$pub" && addr=$pub
+      fi
     fi
   fi
+  [[ -n $addr && $fam == 6 ]] && addr=$(ip6_canon "$addr")
   echo "$addr"
 }
 
@@ -378,6 +495,7 @@ load_config() {
     *) return 1 ;;
   esac
   [[ -n $MASTER && -n $PEER_PUB ]] || return 1
+  FAM=$(addr_fam "$PEER_PUB")
   BH_AUTH=$(kdf "${MASTER}|backhaul|auth" | cut -c1-40)
   if [[ $MODE == udp ]]; then MTU=$MTU_UDP; else MTU=$MTU_ESP; fi
   return 0
@@ -445,7 +563,9 @@ parse_token() {
     *)  T_ENGINE=dnat;    T_BHPORT=$DEFAULT_BH_PORT; T_BHTR=$DEFAULT_BH_TRANSPORT; T_BHTARGET=127.0.0.1 ;;
   esac
   [[ $T_MASTER =~ ^[0-9a-f]{64}$ ]] || return 1
-  valid_ip "$T_IRAN" && valid_ip "$T_KHAREJ" || return 1
+  valid_addr "$T_IRAN" && valid_addr "$T_KHAREJ" || return 1
+  [[ $(addr_fam "$T_IRAN") == "$(addr_fam "$T_KHAREJ")" ]] || return 1      # one tunnel = one IP version
+  T_IRAN=$(norm_addr "$T_IRAN"); T_KHAREJ=$(norm_addr "$T_KHAREJ")
   [[ $T_MODE == esp || $T_MODE == udp ]] || return 1
   valid_port "$T_UDP" || return 1
   [[ $T_PROTO == tcp || $T_PROTO == udp || $T_PROTO == both ]] || return 1
@@ -468,6 +588,7 @@ ensure_deps() {
     have "$c" || missing+=("$c")
   done
   if [[ $MODE == udp ]] && ! have python3; then missing+=(python3); fi
+  if [[ $FAM == 6 ]] && ! have ip6tables; then missing+=(ip6tables); fi
   if [[ $ENGINE == backhaul ]]; then
     for c in tar gzip curl; do have "$c" || missing+=("$c"); done
     # the self-signed certificate of wss / wssmux is created on the Iran server only
@@ -489,6 +610,7 @@ ensure_deps() {
       ping)    [[ $pm == apt ]] && pkgs+=(iputils-ping) || pkgs+=(iputils) ;;
       awk)     pkgs+=(gawk) ;;
       iptables|python3|tar|gzip|curl|openssl) pkgs+=("$c") ;;
+      ip6tables) pkgs+=(iptables) ;;
       *)       pkgs+=(coreutils) ;;
     esac
   done
@@ -514,8 +636,9 @@ load_modules() {
 }
 
 check_kernel() {
-  local t="espchk0" out virt k
+  local t="espchk0" out virt k osrc odst oa
   local -a enc=()
+  if [[ $FAM == 6 ]]; then osrc=fd00:5e5:7::2; odst=fd00:5e5:7::3; oa="::"; else osrc=127.0.0.2; odst=127.0.0.3; oa="0.0.0.0"; fi
   virt=$(systemd-detect-virt 2>/dev/null)
   case $virt in
     openvz|lxc|lxc-libvirt) warn "Virtualization '$virt' detected - XFRM/IPsec normally does NOT work inside containers." ;;
@@ -529,15 +652,18 @@ check_kernel() {
   fi
   ip link del "$t" 2>/dev/null
   k=$(printf '%072d' 0)
-  [[ $MODE == udp ]] && enc=(encap espinudp 4500 4500 0.0.0.0)
-  if ! out=$(ip xfrm state add src 127.0.0.2 dst 127.0.0.3 proto esp spi 0x1c0ffee0 reqid 4242 mode tunnel \
+  [[ $MODE == udp ]] && enc=(encap espinudp 4500 4500 "$oa")
+  if ! out=$(ip xfrm state add src "$osrc" dst "$odst" proto esp spi 0x1c0ffee0 reqid 4242 mode tunnel \
              aead 'rfc4106(gcm(aes))' "0x$k" 128 "${enc[@]}" if_id 4242 2>&1); then
     err "Cannot create an AES-GCM ESP state (kernel crypto, or iproute2 without if_id/encap support): $out"
+    if [[ $FAM == 6 && $MODE == udp ]]; then
+      err "IPv6 ESP-in-UDP needs Linux >= 5.8 (this kernel: $(uname -r)). Use IPv4, raw ESP, or a newer kernel."
+    fi
     return 1
   fi
-  ip xfrm state delete src 127.0.0.2 dst 127.0.0.3 proto esp spi 0x1c0ffee0 2>/dev/null
+  ip xfrm state delete src "$osrc" dst "$odst" proto esp spi 0x1c0ffee0 2>/dev/null
   if ! out=$(ip xfrm policy add src 10.255.255.1/32 dst 10.255.255.2/32 dir out if_id 4242 \
-             tmpl src 127.0.0.2 dst 127.0.0.3 proto esp reqid 4242 mode tunnel 2>&1); then
+             tmpl src "$osrc" dst "$odst" proto esp reqid 4242 mode tunnel 2>&1); then
     err "Cannot create an XFRM policy with if_id (iproute2 too old?): $out"
     return 1
   fi
@@ -571,6 +697,16 @@ preflight_check() {
     echo "$lst" >&2
     bad=1
   fi
+  if [[ $FAM == 6 ]]; then
+    if [[ $(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null) == 1 ]]; then
+      err "IPv6 is disabled on this server (net.ipv6.conf.all.disable_ipv6 = 1) - enable it or use IPv4."
+      bad=1
+    fi
+    if ! ip -6 route show default 2>/dev/null | grep -q .; then
+      warn "No IPv6 default route on this server - the other server's IPv6 address will probably not be reachable."
+    fi
+    have ip6tables || warn "ip6tables is missing - the IPv6 firewall rules cannot be created."
+  fi
   if [[ $MODE == udp ]] && ! systemctl is-active --quiet "$APP" 2>/dev/null; then
     if [[ -n $(ss -Hlun "sport = :${UDP_PORT}" 2>/dev/null) ]]; then
       holder=$(ss -Hlunp "sport = :${UDP_PORT}" 2>/dev/null | grep -o 'users:(("[^"]*"' | head -n1)
@@ -592,7 +728,22 @@ preflight_check() {
 # ------------------------------------------------------------------------------
 #  Firewall (iptables, dedicated chains so cleanup is exact)
 # ------------------------------------------------------------------------------
-ipt() { iptables -w 5 "$@"; }
+ipt()  { iptables  -w 5 "$@"; }
+ip6t() { ip6tables -w 5 "$@"; }
+
+fw6_chain_reset() {   # chain hook-chain   (ip6tables, filter table)
+  local c=$1 h=$2
+  while ip6t -D "$h" -j "$c" 2>/dev/null; do :; done
+  ip6t -N "$c" 2>/dev/null || ip6t -F "$c"
+  ip6t -I "$h" 1 -j "$c"
+}
+
+fw6_chain_remove() {
+  local c=$1 h=$2
+  while ip6t -D "$h" -j "$c" 2>/dev/null; do :; done
+  ip6t -F "$c" 2>/dev/null
+  ip6t -X "$c" 2>/dev/null
+}
 
 fw_chain_reset() {   # table chain hook-chain
   local t=$1 c=$2 h=$3
@@ -615,6 +766,8 @@ fw_remove() {
   fw_chain_remove mangle ESPT_MSS  POSTROUTING
   fw_chain_remove nat    ESPT_PRE  PREROUTING
   fw_chain_remove nat    ESPT_POST POSTROUTING
+  have ip6tables && fw6_chain_remove ESPT_IN6 INPUT
+  return 0
 }
 
 fw_apply() {
@@ -623,8 +776,17 @@ fw_apply() {
 
   # accept the tunnel transport from the peer + everything that comes out of the tunnel
   fw_chain_reset filter ESPT_IN INPUT
-  ipt -A ESPT_IN -i "$IF_NAME" -j ACCEPT
-  if [[ $MODE == udp ]]; then
+  ipt -A ESPT_IN -i "$IF_NAME" -j ACCEPT          # the inner (10.10.10.x) traffic is always IPv4
+  if [[ $FAM == 6 ]]; then
+    # outer packets from the peer arrive over IPv6: own chain in ip6tables
+    fw6_chain_reset ESPT_IN6 INPUT
+    if [[ $MODE == udp ]]; then
+      ip6t -A ESPT_IN6 -p udp -s "$PEER_PUB" --dport "$UDP_PORT" -j ACCEPT
+      ip6t -A ESPT_IN6 -p udp -s "$PEER_PUB" --sport "$UDP_PORT" -j ACCEPT   # replies to our own probes
+    else
+      ip6t -A ESPT_IN6 -p 50 -s "$PEER_PUB" -j ACCEPT
+    fi
+  elif [[ $MODE == udp ]]; then
     ipt -A ESPT_IN -p udp -s "$PEER_PUB" --dport "$UDP_PORT" -j ACCEPT
     ipt -A ESPT_IN -p udp -s "$PEER_PUB" --sport "$UDP_PORT" -j ACCEPT   # replies to our own probes
   else
@@ -670,7 +832,7 @@ fw_apply() {
 
 # transport packets from the peer accepted since the firewall chain was (re)loaded
 outer_rx_count() {
-  ipt -nvxL ESPT_IN 2>/dev/null | awk -v p="$PEER_PUB" -v m="$MODE" -v port="$UDP_PORT" '
+  { if [[ $FAM == 6 ]]; then ip6t -nvxL ESPT_IN6; else ipt -nvxL ESPT_IN; fi; } 2>/dev/null | awk -v p="$PEER_PUB" -v m="$MODE" -v port="$UDP_PORT" '
     $3 == "ACCEPT" && $8 == p {
       if (m == "udp") { if ($4 == "udp" && $0 ~ ("dpt:" port "( |$)")) s += $1 }
       else if ($4 == "esp" || $4 == "50") s += $1
@@ -680,9 +842,11 @@ outer_rx_count() {
 
 # ---- inner MTU ---------------------------------------------------------------
 # largest inner packet that still fits into an outer packet of <$1> bytes
-# (outer IP 20 + [UDP 8] + ESP header 8 + IV 8 + ICV 16; ESP pads payload+2 to a multiple of 4)
+# (outer IP 20 (IPv6: 40) + [UDP 8] + ESP header 8 + IV 8 + ICV 16; ESP pads payload+2 to a multiple of 4)
 mtu_fit() {
-  local avail=$(( $1 - 20 - 8 - 8 - 16 ))
+  local iph=20
+  [[ $FAM == 6 ]] && iph=40
+  local avail=$(( $1 - iph - 8 - 8 - 16 ))
   [[ $MODE == udp ]] && avail=$(( avail - 8 ))
   echo $(( avail / 4 * 4 - 2 ))
 }
@@ -828,7 +992,9 @@ sa_add() {   # sa_add <in|out> <epoch>
   key=$(kdf "${MASTER}|key|${label}|${e}" | cut -c1-72)     # 32-byte AES key + 4-byte GCM salt
   args=(src "$src" dst "$dst" proto esp spi "$spi" reqid "$IF_ID" mode tunnel
         aead 'rfc4106(gcm(aes))' "0x${key}" 128)
-  if [[ $MODE == udp ]]; then args+=(encap espinudp "$UDP_PORT" "$UDP_PORT" 0.0.0.0); fi
+  if [[ $MODE == udp ]]; then
+    if [[ $FAM == 6 ]]; then args+=(encap espinudp "$UDP_PORT" "$UDP_PORT" "::"); else args+=(encap espinudp "$UDP_PORT" "$UDP_PORT" 0.0.0.0); fi
+  fi
   args+=(if_id "$IF_ID")
 
   ip xfrm state delete src "$src" dst "$dst" proto esp spi "$spi" 2>/dev/null
@@ -910,7 +1076,7 @@ udp_helper_start() {   # holds the UDP socket that lets the kernel decapsulate E
   local pid i
   udp_helper_stop
   mkdir -p "$RUN_DIR"
-  python3 -c "$PY_UDP" "$UDP_PORT" >/dev/null 2>"${RUN_DIR}/udp.err" &
+  python3 -c "$PY_UDP" "$FAM" "$UDP_PORT" >/dev/null 2>"${RUN_DIR}/udp.err" &
   pid=$!
   echo "$pid" > "$UDP_PID_FILE"
   for i in 1 2 3 4 5 6 7 8; do
@@ -932,7 +1098,7 @@ udp_helper_alive() {
   [[ $pid =~ ^[0-9]+$ ]] || return 1
   kill -0 "$pid" 2>/dev/null || return 1
   cl=$({ tr '\0' ' ' < "/proc/${pid}/cmdline"; } 2>/dev/null)
-  [[ $cl == *ESPT* && $cl =~ [[:space:]]${UDP_PORT}[[:space:]]*$ ]]
+  [[ $cl == *ESPT* && $cl =~ [[:space:]]${FAM}[[:space:]]${UDP_PORT}[[:space:]]*$ ]]
 }
 
 udp_helper_ensure() { udp_helper_alive && return 0; udp_helper_start; }
@@ -1449,7 +1615,7 @@ cmd_daemon() {
       XPREV=$xcur
 
       # firewall rules removed by ufw / firewalld / netfilter-persistent / iptables-restore
-      if ! ipt -C INPUT -j ESPT_IN >/dev/null 2>&1; then
+      if ! ipt -C INPUT -j ESPT_IN >/dev/null 2>&1 || { [[ $FAM == 6 ]] && ! ip6t -C INPUT -j ESPT_IN6 >/dev/null 2>&1; }; then
         log "WARN: the tunnel firewall rules were removed by something else - restoring them"
         fw_apply
       fi
@@ -1685,6 +1851,28 @@ ask_transport() {
   fi
 }
 
+# IP version of the connection between the two servers (the outer packets of the ESP tunnel).
+# Chosen on the Iran server; the Kharej side follows the token (and its own Iran-IP answer).
+ask_ip_family() {
+  local c def=1
+  [[ ${FAM:-4} == 6 ]] && def=2
+  echo
+  echo "IP version of the connection between the two servers:"
+  echo "  1) IPv4 (default)"
+  echo "  2) IPv6   (both servers need a working public IPv6 address and route; ESP-in-UDP needs Linux >= 5.8;"
+  echo "             the tunnel addresses inside stay 10.10.10.1 / 10.10.10.2)"
+  while true; do
+    read -r -p "Select [${def}]: " c
+    case ${c:-$def} in
+      1|4) FAM=4 ;;
+      2|6) FAM=6 ;;
+      *) err "Invalid choice."; continue ;;
+    esac
+    break
+  done
+  ok "Connection between the servers: IPv${FAM}"
+}
+
 # Backhaul transport = the protocol of the reverse tunnel that runs INSIDE the ESP tunnel.
 # Chosen on the Iran server; the Kharej side takes it from the token.
 ask_bh_transport() {
@@ -1766,10 +1954,12 @@ ask_bh_target() {
 }
 
 fw_hint() {
+  local v=""
+  [[ $FAM == 6 ]] && v=" for IPv6"
   if [[ $MODE == udp ]]; then
-    echo "Open UDP ${UDP_PORT} (in and out) in your provider's external / cloud firewall if it has one."
+    echo "Open UDP ${UDP_PORT} (in and out${v}) in your provider's external / cloud firewall if it has one."
   else
-    echo "Open IP protocol 50 (ESP) in your provider's external / cloud firewall if it has one."
+    echo "Open IP protocol 50 (ESP${v}) in your provider's external / cloud firewall if it has one."
   fi
 }
 
@@ -1814,7 +2004,7 @@ pmtu_scan() {
   [[ $MODE == udp ]] && have python3 || return 1
   cur=$MTU
   [[ -r /sys/class/net/${IF_NAME}/mtu ]] && cur=$(<"/sys/class/net/${IF_NAME}/mtu")
-  list=($(( cur + 65 )))                      # biggest outer packet this tunnel can create
+  list=($(( cur + 65 + (FAM == 6 ? 20 : 0) )))   # biggest outer packet this tunnel can create
   for s in 1500 1480 1460 1440 1420 1400 1380 1360 1340 1300 1280; do
     (( s < list[0] )) && list+=("$s")
   done
@@ -1849,7 +2039,7 @@ diagnose() {
   row "Interface" "${x:-${C_R}${IF_NAME} missing${C_0}}"
   if [[ $dev == "$IF_NAME" ]]; then row "Route to peer" "via ${IF_NAME} (ok)"; else row "Route to peer" "${C_R}via '${dev:-none}' (must be ${IF_NAME})${C_0}"; fi
   row "Kernel state" "policies ${n_pol}/3, SAs ${n_sa}/4"
-  if ipt -nL ESPT_IN >/dev/null 2>&1; then fw_ok="loaded"; else fw_ok="${C_R}missing${C_0}"; fi
+  if ipt -nL ESPT_IN >/dev/null 2>&1 && { [[ $FAM != 6 ]] || ip6t -nL ESPT_IN6 >/dev/null 2>&1; }; then fw_ok="loaded"; else fw_ok="${C_R}missing${C_0}"; fi
   row "Firewall chain" "$fw_ok"
 
   if [[ $MODE == udp ]] && have python3; then
@@ -1857,7 +2047,7 @@ diagnose() {
     read -r pr_ok pr_n pr_rtt pr_skew <<< "$(udp_probe 5)"
     pr_ok=${pr_ok:-0}; pr_n=${pr_n:-5}; pr_rtt=${pr_rtt:--}; pr_skew=${pr_skew:--}
     if (( pr_ok > 0 )); then
-      row "UDP probe" "${pr_ok}/${pr_n} replies from ${PEER_PUB}:${UDP_PORT}, rtt ${pr_rtt} ms, peer clock offset ${pr_skew} s"
+      row "UDP probe" "${pr_ok}/${pr_n} replies from $(hp "$PEER_PUB" "$UDP_PORT"), rtt ${pr_rtt} ms, peer clock offset ${pr_skew} s"
       if [[ $pr_skew =~ ^-?[0-9]+$ ]]; then
         skew_abs=${pr_skew#-}
         if (( skew_abs > 60 )); then warn "  the two clocks differ by ${pr_skew}s - fix with menu 13 on the server that is wrong"; fi
@@ -1875,7 +2065,7 @@ diagnose() {
         row "Path MTU" "not measured (no probe size was answered)"
       fi
     else
-      row "UDP probe" "${C_R}0/${pr_n} replies - nothing answers on ${PEER_PUB}:${UDP_PORT}/udp${C_0}"
+      row "UDP probe" "${C_R}0/${pr_n} replies - nothing answers on $(hp "$PEER_PUB" "$UDP_PORT")/udp${C_0}"
     fi
   fi
 
@@ -1997,24 +2187,16 @@ setup_iran() {
   ROLE=iran; ENGINE=backhaul; BH_PORT=$DEFAULT_BH_PORT; BH_TARGET=127.0.0.1
   ask_transport
   ask_bh_transport
+  ask_ip_family
   ensure_deps     || { pause; return; }
   preflight_check || { pause; return; }
   check_kernel    || { pause; return; }
   ensure_backhaul || { pause; return; }
   cron_warn
 
-  det=$(detect_public_ip)
-  while true; do
-    read -r -p "Iran server public IP [${det}]: " IRAN_IP
-    IRAN_IP=${IRAN_IP:-$det}
-    valid_ip "$IRAN_IP" && break
-    err "Invalid IPv4 address."
-  done
-  while true; do
-    read -r -p "Kharej (foreign) server public IP: " KHAREJ_IP
-    valid_ip "$KHAREJ_IP" && break
-    err "Invalid IPv4 address."
-  done
+  det=$(detect_public_ip "$FAM")
+  IRAN_IP=$(ask_addr "Iran server public IPv${FAM} [${det}]: " "$det" "$FAM")
+  KHAREJ_IP=$(ask_addr "Kharej (foreign) server public IPv${FAM}: " "" "$FAM")
   if ! route_info "$KHAREJ_IP"; then err "No route to $KHAREJ_IP from this server."; pause; return; fi
   if [[ $LOCAL_ADDR != "$IRAN_IP" ]]; then
     warn "This server's local address towards Kharej is $LOCAL_ADDR, not $IRAN_IP (NAT?)."
@@ -2063,7 +2245,22 @@ setup_kharej() {
     err "Invalid token (copy error?). Copy it again from the Iran server (menu option 8). Tokens made by the old Rathole version are not valid - create a new one on the Iran server."
   done
   ROLE=kharej
-  MODE=$T_MODE; ENGINE=$T_ENGINE; BH_PORT=$T_BHPORT; BH_TRANSPORT=$T_BHTR; BH_TARGET=$T_BHTARGET
+  MODE=$T_MODE; UDP_PORT=$T_UDP; ENGINE=$T_ENGINE; BH_PORT=$T_BHPORT; BH_TRANSPORT=$T_BHTR; BH_TARGET=$T_BHTARGET
+
+  # The Kharej server connects to the Iran server: ask for its public IP (IPv4 or IPv6).
+  # Enter = the address stored in the token.
+  echo
+  echo "Public IP of the IRAN server - the Kharej server connects to it (IPv4 or IPv6)."
+  echo "The token says: ${T_IRAN}  (press Enter to use it, or type another address)."
+  IRAN_IP=$(ask_addr "Iran server public IP [${T_IRAN}]: " "$T_IRAN")
+  FAM=$(addr_fam "$IRAN_IP")
+  if [[ $FAM != "$(addr_fam "$T_KHAREJ")" ]]; then
+    err "The token was made for IPv$(addr_fam "$T_KHAREJ") (Kharej ${T_KHAREJ}) but ${IRAN_IP} is an IPv${FAM} address."
+    err "Both servers must use the same IP version. To switch: run menu 15 on the Iran server, then paste the NEW token here."
+    pause; return
+  fi
+  info "Connection between the servers: IPv${FAM}  (Iran ${IRAN_IP})"
+
   ensure_deps     || { pause; return; }
   preflight_check || { pause; return; }
   check_kernel    || { pause; return; }
@@ -2072,7 +2269,7 @@ setup_kharej() {
   fi
   cron_warn
 
-  IRAN_IP=$T_IRAN; KHAREJ_IP=$T_KHAREJ; UDP_PORT=$T_UDP
+  KHAREJ_IP=$T_KHAREJ
   PORTS=$(norm_ports "$T_PORTS"); FWD_PROTO=$T_PROTO; MASTER=$T_MASTER; ROLE=kharej
   FORCE_REBUILD_SEC=$DEFAULT_FORCE_REBUILD_SEC
   RX_STALL_SEC=$DEFAULT_RX_STALL_SEC
@@ -2140,7 +2337,7 @@ cmd_status() {
 
   echo "${C_B}===================== ESP Tunnel status =====================${C_0}"
   echo "Role          : $ROLE   (${LOCAL_INNER}  <->  ${PEER_INNER})"
-  echo "Peer public IP: $PEER_PUB"
+  echo "Peer public IP: $PEER_PUB   (outer packets over IPv${FAM})"
   if [[ $MODE == udp ]]; then echo "Transport     : ESP-in-UDP, port $UDP_PORT"
   else echo "Transport     : raw ESP (IP protocol 50)"; fi
   echo "Cipher        : AES-256-GCM, MTU $(cat "/sys/class/net/${IF_NAME}/mtu" 2>/dev/null || echo "$MTU"), next key rotation in $((left / 60)) min (epoch $epoch)"
@@ -2193,7 +2390,7 @@ cmd_status() {
     iptables -t nat -vnL ESPT_PRE 2>/dev/null | sed -n '2,$p'
   fi
   echo
-  echo "No ping? Run menu 11 (Diagnose) on both servers.   Raw ESP on the wire: tcpdump -ni $WAN_DEV 'ip proto 50'"
+  echo "No ping? Run menu 11 (Diagnose) on both servers.   Raw ESP on the wire: tcpdump -ni $WAN_DEV '$( [[ $FAM == 6 ]] && echo "ip6 proto 50" || echo "ip proto 50" )'"
 }
 
 live_counters() {
@@ -2334,6 +2531,55 @@ change_bh_transport() {
   fi
 }
 
+# Change the server IPs / switch the connection between IPv4 and IPv6 on an installed tunnel.
+# Iran first (new token), then Kharej (paste it; it asks for the Iran IP again). Same key, no re-install.
+change_addresses() {
+  local tok det def_i def_k
+  load_config 2>/dev/null || { warn "Tunnel is not installed."; return; }
+
+  if [[ $ROLE == iran ]]; then
+    info "Current: Iran ${IRAN_IP}  <->  Kharej ${KHAREJ_IP}   (IPv${FAM})"
+    ask_ip_family
+    ensure_deps  || return
+    check_kernel || return
+    det=$(detect_public_ip "$FAM")
+    def_i=$det; [[ $(addr_fam "$IRAN_IP") == "$FAM" ]] && def_i=$IRAN_IP
+    def_k="";   [[ $(addr_fam "$KHAREJ_IP") == "$FAM" ]] && def_k=$KHAREJ_IP
+    IRAN_IP=$(ask_addr "Iran server public IPv${FAM} [${def_i}]: " "$def_i" "$FAM")
+    KHAREJ_IP=$(ask_addr "Kharej server public IPv${FAM} [${def_k}]: " "$def_k" "$FAM")
+    route_info "$KHAREJ_IP" || { err "No route to $KHAREJ_IP from this server (nothing was changed)."; return; }
+    write_config
+    load_config
+    systemctl restart "$APP" && ok "Tunnel restarted with the new addresses (IPv${FAM})."
+    print_token
+    warn "Kharej server: run this option (15) and paste the token above. The link stays down until both sides match."
+    fw_hint
+  else
+    echo "Paste the NEW token shown by the Iran server after it changed the addresses (Iran: menu 15 or 8)."
+    read -r -p "Token: " tok
+    parse_token "$tok" || { err "Invalid token."; return; }
+    [[ $T_MASTER == "$MASTER" ]] || { err "That token belongs to a different tunnel (key mismatch)."; return; }
+    [[ $T_ENGINE == "$ENGINE" ]] || { err "That token was made for another engine (${T_ENGINE})."; return; }
+    IRAN_IP=$(ask_addr "Iran server public IP [${T_IRAN}]: " "$T_IRAN")
+    FAM=$(addr_fam "$IRAN_IP")
+    if [[ $FAM != "$(addr_fam "$T_KHAREJ")" ]]; then
+      err "The token was made for IPv$(addr_fam "$T_KHAREJ") but ${IRAN_IP} is an IPv${FAM} address (nothing was changed)."
+      return
+    fi
+    KHAREJ_IP=$T_KHAREJ; MODE=$T_MODE; UDP_PORT=$T_UDP; PORTS=$(norm_ports "$T_PORTS"); FWD_PROTO=$T_PROTO
+    BH_TRANSPORT=$T_BHTR; BH_TARGET=$T_BHTARGET
+    ensure_deps  || return
+    check_kernel || return
+    route_info "$IRAN_IP" || { err "No route to the Iran server $IRAN_IP (nothing was changed)."; return; }
+    write_config
+    load_config
+    restart_tunnel
+    info "Waiting for the tunnel (up to 20 s)..."
+    if wait_link 20; then ok "Tunnel is UP - ${PEER_INNER} answers ping."; else warn "No answer yet - running the diagnosis..."; diagnose; fi
+    fw_hint
+  fi
+}
+
 # Change transport (raw ESP <-> ESP-in-UDP) or the UDP port on an installed tunnel.
 # Iran: choose, get a new token. Kharej: paste that token. No re-install, same key.
 change_transport() {
@@ -2459,7 +2705,7 @@ banner() {
   echo "${C_B}   Iran ${IP_IRAN}  <=======  ESP  =======>  Kharej ${IP_KHAREJ}${C_0}"
   echo "${C_B}==============================================================${C_0}"
   if load_config 2>/dev/null; then
-    echo " Installed role: $ROLE   |   engine: $ENGINE$( [[ $ENGINE == backhaul ]] && echo " ($BH_TRANSPORT)" )   |   service: $(systemctl is-active "$APP" 2>/dev/null)"
+    echo " Installed role: $ROLE   |   IPv${FAM}   |   engine: $ENGINE$( [[ $ENGINE == backhaul ]] && echo " ($BH_TRANSPORT)" )   |   service: $(systemctl is-active "$APP" 2>/dev/null)"
     if [[ $ENGINE == rathole ]]; then
       warn "This install still uses the old Rathole engine, which is no longer part of this script - run option 5, then option 1 / 2 to switch to Backhaul."
     fi
@@ -2488,6 +2734,7 @@ menu() {
     echo " 12) Change transport / UDP port (Iran first, then Kharej)"
     echo " 13) Sync system clock (keys depend on it)"
     echo " 14) Change Backhaul transport (Iran first, then Kharej)"
+    echo " 15) Change server IPs / IPv4 <-> IPv6 (Iran first, then Kharej)"
     echo "  0) Exit"
     echo
     read -r -p "Select: " ch || exit 0
@@ -2507,6 +2754,7 @@ menu() {
       12) change_transport; echo; pause ;;
       13) sync_clock; echo; pause ;;
       14) change_bh_transport; echo; pause ;;
+      15) change_addresses; echo; pause ;;
       0|q|Q) exit 0 ;;
       *) warn "Invalid choice."; sleep 1 ;;
     esac
