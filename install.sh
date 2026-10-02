@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  ESP Tunnel Manager v2.2 - point-to-point tunnel over IP protocol 50 (ESP)
-#                            + Rathole reverse tunnel carried inside it
+#  ESP Tunnel Manager v2.4 - point-to-point tunnel over IP protocol 50 (ESP)
+#                            + Backhaul reverse tunnel carried inside it
 #
-#    Iran server   : 10.10.10.2   (menu option 1)   rathole SERVER
-#    Kharej client : 10.10.10.1   (menu option 2)   rathole CLIENT
+#    Iran server   : 10.10.10.2   (menu option 1)   backhaul SERVER
+#    Kharej client : 10.10.10.1   (menu option 2)   backhaul CLIENT
 #
 #  How it works
 #   * Linux kernel XFRM (IPsec ESP) + an "xfrm interface" (espt0) on each side.
@@ -14,8 +14,43 @@
 #     (previous/current/next hour inbound SAs are always loaded -> no downtime).
 #   * Transport: ESP-in-UDP (default - survives NAT and protocol-50 filtering)
 #     or raw ESP (IP protocol 50).
-#   * Rathole (reverse tunnel) runs inside the tunnel: the Kharej client dials
-#     10.10.10.2:8090 through ESP, the Iran server opens the public ports.
+#   * Backhaul (reverse tunnel, github.com/Musixal/Backhaul) runs inside the tunnel: the Kharej
+#     client dials 10.10.10.2:8090 through ESP, the Iran server opens the public ports.
+#     The Backhaul transport is chosen during the install on the Iran server:
+#     tcp / tcpmux / udp / ws / wss / wsmux / wssmux (it travels inside the token).
+#
+#  v2.4 - Backhaul core instead of Rathole
+#   * The reverse tunnel inside the ESP tunnel is now Backhaul. The core is downloaded from the
+#     official release (backhaul_linux_<arch>.tar.gz); a local file / mirror URL is accepted too.
+#   * The Backhaul transport is selected during the install (Iran side): tcp, tcpmux, udp, ws, wss,
+#     wsmux, wssmux. The Kharej side follows the token automatically. wss / wssmux use a
+#     self-signed certificate that is generated on the Iran server.
+#   * NEW menu 14: change the Backhaul transport later (Iran first, then Kharej) - same key.
+#   * The port list, the UDP switch (accept_udp, tcp transport only) and the target address live in
+#     the Iran server's Backhaul config. The target address is therefore asked on the Iran side and
+#     travels inside the token (token format v3; v1 / v2 "dnat" tokens are still accepted).
+#   * Fix: the persistent sysctl file was written with a literal "\n" instead of line breaks.
+#   * Everything else (ESP tunnel, key rotation, watchdog, self-healing, MTU, tuning, diagnose) is unchanged.
+#
+#  v2.3 - second hardening pass: everything that can cause disconnects or slow transfers
+#   * MTU is derived from the WAN link MTU (never above the old safe default); menu 9 can
+#     set a value or press m to MEASURE the real path MTU with DF probes. A path-MTU black
+#     hole is the classic "ping works but downloads stall / crawl" failure. Diagnose shows it.
+#   * Self-healing every 30 s, without waiting for ping failures: restores firewall rules that
+#     ufw/firewalld/netfilter-persistent removed, restarts a dead UDP helper (no helper = no
+#     ESP-in-UDP at all), notices a changed local IP / default route / renamed NIC, a missing
+#     tunnel address, flushed xfrm policies or states.
+#   * Fewer false rebuilds: a lost ping while real traffic still arrives no longer rebuilds;
+#     the preventive rebuild waits for a quiet moment (at most 1 h); the UDP helper socket
+#     survives rebuilds (no gap for incoming ESP packets); pings tolerate 2 s of queueing.
+#   * Settings changes (menu 9) apply live (SIGHUP / ip link set): no service restart, so
+#     rathole connections are not dropped.
+#   * Network tuning (on by default, switch in menu 9): BBR+fq, bigger TCP buffers, bigger
+#     netdev backlog (decrypted packets queue there), TCP MTU probing, no slow-start after
+#     idle, bigger conntrack table. Original values are saved and restored when switched
+#     off / on uninstall. ip_forward is only enabled for the legacy DNAT engine now.
+#   * systemd: OOMScoreAdjust so the tunnel is not the OOM killer's first victim.
+#   * Upgrade without re-install: run the new file, menu 7 (it copies itself to /usr/local/bin).
 #
 #  v2.2 - fixes for "no ping / no connection after install"
 #   * NEW Diagnose (menu 11 / `esp-tunnel diag`): measures packets during a live test and
@@ -43,7 +78,7 @@
 # ==============================================================================
 
 APP="esp-tunnel"
-VERSION="2.2"
+VERSION="2.4"
 BIN="/usr/local/bin/${APP}"
 CONF_DIR="/etc/${APP}"
 CONF="${CONF_DIR}/config"
@@ -52,19 +87,22 @@ SYSCTL_FILE="/etc/sysctl.d/99-${APP}.conf"
 RUN_DIR="/run/${APP}"
 REG="${RUN_DIR}/sa.list"
 UDP_PID_FILE="${RUN_DIR}/udp.pid"
+TUNE_ORIG="${CONF_DIR}/sysctl.orig"     # sysctl values of this server before the tuning
 
-# rathole (reverse tunnel engine)
+# Backhaul (reverse tunnel engine)
 LIB_DIR="/usr/local/lib/${APP}"
-RH_BIN="${LIB_DIR}/rathole"
-RH_CONF="${CONF_DIR}/rathole.toml"
-RH_UNIT="${APP}-rathole"
-RH_UNIT_FILE="/etc/systemd/system/${RH_UNIT}.service"
-RH_REPO="rathole-org/rathole"
-RH_FALLBACK_TAG="v0.5.0"          # used when the latest tag cannot be resolved
-DEFAULT_RH_PORT=8090              # control port, bound on the tunnel address only
-RH_HB_INTERVAL=15                 # server heartbeat (s)  - must stay below RH_HB_TIMEOUT
-RH_HB_TIMEOUT=45                  # client heartbeat timeout (s)
-MAX_FWD_PORTS=300                 # rathole needs one service per port
+BH_BIN="${LIB_DIR}/backhaul"
+BH_CONF="${CONF_DIR}/backhaul.toml"
+BH_CRT="${CONF_DIR}/backhaul.crt"         # self-signed certificate for wss / wssmux (Iran side)
+BH_KEY="${CONF_DIR}/backhaul.key"
+BH_UNIT="${APP}-backhaul"
+BH_UNIT_FILE="/etc/systemd/system/${BH_UNIT}.service"
+BH_REPO="Musixal/Backhaul"
+BH_FALLBACK_TAG="v0.7.2"          # used when the latest tag cannot be resolved
+DEFAULT_BH_PORT=8090              # control port, bound on the tunnel address only
+DEFAULT_BH_TRANSPORT="tcp"
+BH_HB_INTERVAL=15                 # server heartbeat (s)
+MAX_FWD_PORTS=1000                # Backhaul opens one listener per forwarded port
 
 IF_NAME="espt0"
 IF_ID=42
@@ -85,11 +123,13 @@ PORTS=""; FWD_PROTO="both"
 LOCAL_INNER=""; PEER_INNER=""; PEER_PUB=""; OUT_LABEL=""; IN_LABEL=""; MTU="$MTU_ESP"
 LOCAL_ADDR=""; WAN_DEV=""; CUR_EPOCH=0
 FORCE_REBUILD_SEC="$DEFAULT_FORCE_REBUILD_SEC"; RX_STALL_SEC="$DEFAULT_RX_STALL_SEC"
-ENGINE=""; RH_PORT="$DEFAULT_RH_PORT"; RH_TARGET="127.0.0.1"; RH_AUTH=""
+ENGINE=""; BH_PORT="$DEFAULT_BH_PORT"; BH_TARGET="127.0.0.1"; BH_AUTH=""; BH_TRANSPORT="$DEFAULT_BH_TRANSPORT"
+MTU_SET=0; NET_TUNE=1            # MTU_SET 0 = automatic;  NET_TUNE 1 = BBR / buffer tuning on
 
 # ---- daemon watchdog state (globals; meaningful only while cmd_daemon runs) --
 RX0=0; TX0=0; RX_STALL_START=0; LAST_REBUILD=0; FAILS=0; PEER_STATE="unknown"; XPREV=""
 REB_N=0; BACKOFF_UNTIL=0; UP_SINCE=0; EVER_UP=0; CNT_RX=0; CNT_TX=0
+PREV_BYTES=0; PING_RX0=0; BASE_POL=0; BASE_SA=0; PM_BEST=0; PM_REC=0
 
 # UDP socket that lets the kernel decapsulate ESP-in-UDP. The kernel hands packets that start
 # with four zero bytes (the "non-ESP marker") to user space: those are used as clear-text probes.
@@ -141,8 +181,46 @@ for i in range(n):
             pass
     time.sleep(0.2)
 r = "%.0f" % (sum(rtt) / len(rtt)) if rtt else "-"
-k = "%.0f" % (sum(skew) / len(skew)) if skew else "-"
+k = str(int(round(sum(skew) / len(skew)))) if skew else "-"
 print(ok, n, r, k)
+'
+
+# Path-MTU probe: DF-marked probes of the given total IP sizes (descending); prints the first
+# size that the peer answers (0 = none). The reply is tiny, so this measures our -> peer direction.
+PY_PMTU='
+import socket, sys, os
+host, port = sys.argv[1], int(sys.argv[2])
+sizes = [int(x) for x in sys.argv[3:]]
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(0.8)
+try:
+    s.setsockopt(socket.IPPROTO_IP, 10, 2)   # IP_MTU_DISCOVER = IP_PMTUDISC_DO (sets DF)
+except Exception:
+    pass
+best = 0
+for size in sizes:
+    pl = size - 28
+    if pl < 40:
+        continue
+    nonce = os.urandom(4).hex().encode()
+    pkt = (b"\x00\x00\x00\x00ESPT?" + nonce + b"." + b"x" * pl)[:pl]
+    got = False
+    for attempt in range(2):
+        try:
+            s.sendto(pkt, (host, port))
+            while True:
+                d, a = s.recvfrom(2048)
+                if d.startswith(b"\x00\x00\x00\x00ESPT!" + nonce):
+                    got = True
+                    break
+        except Exception:
+            pass
+        if got:
+            break
+    if got:
+        best = size
+        break
+print(best)
 '
 
 # ------------------------------------------------------------------------------
@@ -192,6 +270,11 @@ is_private_ip() {
 }
 
 valid_port() { [[ $1 =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); }
+
+valid_bh_transport() {
+  case $1 in tcp|tcpmux|udp|ws|wss|wsmux|wssmux) return 0 ;; esac
+  return 1
+}
 
 # "1080, 443 ,8000-8100"  ->  "1080,443,8000-8100"   (returns 1 if invalid)
 norm_ports() {
@@ -279,21 +362,23 @@ detect_public_ip() {
 # ------------------------------------------------------------------------------
 load_config() {
   [[ -r $CONF ]] || return 1
-  ENGINE=""; RH_PORT=""; RH_TARGET=""
+  ENGINE=""; BH_PORT=""; BH_TARGET=""; BH_TRANSPORT=""; MTU_SET=""; NET_TUNE=""
   # shellcheck disable=SC1090
   source "$CONF"
   MODE=${MODE:-esp}; UDP_PORT=${UDP_PORT:-$DEFAULT_UDP_PORT}; FWD_PROTO=${FWD_PROTO:-both}
   FORCE_REBUILD_SEC=${FORCE_REBUILD_SEC:-$DEFAULT_FORCE_REBUILD_SEC}
   RX_STALL_SEC=${RX_STALL_SEC:-$DEFAULT_RX_STALL_SEC}
   # configs written by esp-tunnel 1.x have no engine: they keep the iptables DNAT behaviour
-  ENGINE=${ENGINE:-dnat}; RH_PORT=${RH_PORT:-$DEFAULT_RH_PORT}; RH_TARGET=${RH_TARGET:-127.0.0.1}
+  ENGINE=${ENGINE:-dnat}; BH_PORT=${BH_PORT:-$DEFAULT_BH_PORT}; BH_TARGET=${BH_TARGET:-127.0.0.1}
+  valid_bh_transport "${BH_TRANSPORT:-}" || BH_TRANSPORT=$DEFAULT_BH_TRANSPORT
+  MTU_SET=${MTU_SET:-0}; NET_TUNE=${NET_TUNE:-1}
   case $ROLE in
     iran)   LOCAL_INNER=$IP_IRAN;   PEER_INNER=$IP_KHAREJ; PEER_PUB=$KHAREJ_IP; OUT_LABEL=i2k; IN_LABEL=k2i ;;
     kharej) LOCAL_INNER=$IP_KHAREJ; PEER_INNER=$IP_IRAN;   PEER_PUB=$IRAN_IP;   OUT_LABEL=k2i; IN_LABEL=i2k ;;
     *) return 1 ;;
   esac
   [[ -n $MASTER && -n $PEER_PUB ]] || return 1
-  RH_AUTH=$(kdf "${MASTER}|rathole|auth" | cut -c1-40)
+  BH_AUTH=$(kdf "${MASTER}|backhaul|auth" | cut -c1-40)
   if [[ $MODE == udp ]]; then MTU=$MTU_UDP; else MTU=$MTU_ESP; fi
   return 0
 }
@@ -315,34 +400,38 @@ write_config() {
       printf 'FORCE_REBUILD_SEC=%q\n' "$FORCE_REBUILD_SEC"
       printf 'RX_STALL_SEC=%q\n'      "$RX_STALL_SEC"
       printf 'ENGINE=%q\n'    "$ENGINE"
-      printf 'RH_PORT=%q\n'   "$RH_PORT"
-      printf 'RH_TARGET=%q\n' "$RH_TARGET"
+      printf 'BH_PORT=%q\n'   "$BH_PORT"
+      printf 'BH_TARGET=%q\n' "$BH_TARGET"
+      printf 'BH_TRANSPORT=%q\n' "$BH_TRANSPORT"
+      printf 'MTU_SET=%q\n'  "$MTU_SET"
+      printf 'NET_TUNE=%q\n' "$NET_TUNE"
     } > "$CONF"
   )
   chmod 600 "$CONF"
 }
 
-# token v2 = base64( v2|master|iran_ip|kharej_ip|mode|udp_port|ports|proto|engine|rh_port|checksum )
-# (v1 tokens from older versions are still accepted: they mean engine "dnat")
+# token v3 = base64( v3|master|iran_ip|kharej_ip|mode|udp_port|ports|proto|engine|bh_port|bh_transport|bh_target|checksum )
+# (v1 tokens and v2 tokens of the "dnat" engine are still accepted; v2 tokens of the old Rathole engine are not)
 make_token() {
   local payload chk
-  payload="v2|${MASTER}|${IRAN_IP}|${KHAREJ_IP}|${MODE}|${UDP_PORT}|${PORTS}|${FWD_PROTO}|${ENGINE}|${RH_PORT}"
+  payload="v3|${MASTER}|${IRAN_IP}|${KHAREJ_IP}|${MODE}|${UDP_PORT}|${PORTS}|${FWD_PROTO}|${ENGINE}|${BH_PORT}|${BH_TRANSPORT}|${BH_TARGET}"
   chk=$(printf '%s' "$payload" | sha256sum | cut -c1-6)
   printf '%s|%s' "$payload" "$chk" | base64 -w0
 }
 
-T_MASTER=""; T_IRAN=""; T_KHAREJ=""; T_MODE=""; T_UDP=""; T_PORTS=""; T_PROTO=""; T_ENGINE=""; T_RHPORT=""
+T_MASTER=""; T_IRAN=""; T_KHAREJ=""; T_MODE=""; T_UDP=""; T_PORTS=""; T_PROTO=""; T_ENGINE=""; T_BHPORT=""; T_BHTR=""; T_BHTARGET=""
 parse_token() {
   local t dec n chk want payload
   local -a F=()
   t=$(tr -d '[:space:]' <<<"$1")
   [[ -n $t ]] || return 1
-  dec=$(base64 -d <<<"$t" 2>/dev/null | tr -d '\0') || return 1
+  dec=$(base64 -d <<<"$t" 2>/dev/null) || return 1
   IFS='|' read -ra F <<< "$dec"
   n=${#F[@]}
   case ${F[0]} in
     v1) (( n == 9 ))  || return 1 ;;
     v2) (( n == 11 )) || return 1 ;;
+    v3) (( n == 13 )) || return 1 ;;
     *)  return 1 ;;
   esac
   chk=${F[n-1]}
@@ -350,14 +439,20 @@ parse_token() {
   want=$(printf '%s' "$payload" | sha256sum | cut -c1-6)
   [[ $chk == "$want" ]] || return 1
   T_MASTER=${F[1]}; T_IRAN=${F[2]}; T_KHAREJ=${F[3]}; T_MODE=${F[4]}; T_UDP=${F[5]}; T_PORTS=${F[6]}; T_PROTO=${F[7]}
-  if [[ ${F[0]} == v2 ]]; then T_ENGINE=${F[8]}; T_RHPORT=${F[9]}; else T_ENGINE=dnat; T_RHPORT=$DEFAULT_RH_PORT; fi
+  case ${F[0]} in
+    v3) T_ENGINE=${F[8]}; T_BHPORT=${F[9]}; T_BHTR=${F[10]}; T_BHTARGET=${F[11]} ;;
+    v2) T_ENGINE=${F[8]}; T_BHPORT=${F[9]}; T_BHTR=$DEFAULT_BH_TRANSPORT; T_BHTARGET=127.0.0.1 ;;
+    *)  T_ENGINE=dnat;    T_BHPORT=$DEFAULT_BH_PORT; T_BHTR=$DEFAULT_BH_TRANSPORT; T_BHTARGET=127.0.0.1 ;;
+  esac
   [[ $T_MASTER =~ ^[0-9a-f]{64}$ ]] || return 1
   valid_ip "$T_IRAN" && valid_ip "$T_KHAREJ" || return 1
   [[ $T_MODE == esp || $T_MODE == udp ]] || return 1
   valid_port "$T_UDP" || return 1
   [[ $T_PROTO == tcp || $T_PROTO == udp || $T_PROTO == both ]] || return 1
-  [[ $T_ENGINE == rathole || $T_ENGINE == dnat ]] || return 1
-  valid_port "$T_RHPORT" || return 1
+  [[ $T_ENGINE == backhaul || $T_ENGINE == dnat ]] || return 1
+  valid_port "$T_BHPORT" || return 1
+  valid_bh_transport "$T_BHTR" || return 1
+  valid_ip "$T_BHTARGET" || return 1
   norm_ports "$T_PORTS" >/dev/null || return 1
   return 0
 }
@@ -373,8 +468,12 @@ ensure_deps() {
     have "$c" || missing+=("$c")
   done
   if [[ $MODE == udp ]] && ! have python3; then missing+=(python3); fi
-  if [[ $ENGINE == rathole ]]; then
-    for c in unzip curl; do have "$c" || missing+=("$c"); done
+  if [[ $ENGINE == backhaul ]]; then
+    for c in tar gzip curl; do have "$c" || missing+=("$c"); done
+    # the self-signed certificate of wss / wssmux is created on the Iran server only
+    if [[ $ROLE == iran && ( $BH_TRANSPORT == wss || $BH_TRANSPORT == wssmux ) ]] && ! have openssl; then
+      missing+=(openssl)
+    fi
   fi
   (( ${#missing[@]} == 0 )) && return 0
 
@@ -389,7 +488,7 @@ ensure_deps() {
       ip|ss)   [[ $pm == apt ]] && pkgs+=(iproute2) || pkgs+=(iproute) ;;
       ping)    [[ $pm == apt ]] && pkgs+=(iputils-ping) || pkgs+=(iputils) ;;
       awk)     pkgs+=(gawk) ;;
-      iptables|python3|unzip|curl) pkgs+=("$c") ;;
+      iptables|python3|tar|gzip|curl|openssl) pkgs+=("$c") ;;
       *)       pkgs+=(coreutils) ;;
     esac
   done
@@ -519,7 +618,7 @@ fw_remove() {
 }
 
 fw_apply() {
-  local spec d pr
+  local spec d pr bp=tcp
   local -a specs=() protos=()
 
   # accept the tunnel transport from the peer + everything that comes out of the tunnel
@@ -531,9 +630,10 @@ fw_apply() {
   else
     ipt -A ESPT_IN -p 50 -s "$PEER_PUB" -j ACCEPT
   fi
-  if [[ $ROLE == iran && $ENGINE == rathole ]]; then
-    # the rathole control port lives on the tunnel address only - never answer it from the WAN side
-    ipt -I ESPT_IN 1 -i "$WAN_DEV" -p tcp -d "$IP_IRAN" --dport "$RH_PORT" -j DROP
+  if [[ $ROLE == iran && $ENGINE == backhaul ]]; then
+    # the Backhaul control port lives on the tunnel address only - never answer it from the WAN side
+    [[ $BH_TRANSPORT == udp ]] && bp=udp
+    ipt -I ESPT_IN 1 -i "$WAN_DEV" -p "$bp" -d "$IP_IRAN" --dport "$BH_PORT" -j DROP
   fi
 
   fw_chain_reset filter ESPT_FWD FORWARD
@@ -545,7 +645,7 @@ fw_apply() {
   ipt -t mangle -A ESPT_MSS -o "$IF_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 
   # legacy engine only: iptables DNAT of the chosen ports to the Kharej tunnel address.
-  # With the rathole engine there is NO DNAT - the rathole server owns the public ports.
+  # With the Backhaul engine there is NO DNAT - the Backhaul server owns the public ports.
   if [[ $ROLE == iran && $ENGINE == dnat ]]; then
     fw_chain_reset nat ESPT_PRE  PREROUTING
     fw_chain_reset nat ESPT_POST POSTROUTING
@@ -578,9 +678,95 @@ outer_rx_count() {
     END { print s + 0 }'
 }
 
+# ---- inner MTU ---------------------------------------------------------------
+# largest inner packet that still fits into an outer packet of <$1> bytes
+# (outer IP 20 + [UDP 8] + ESP header 8 + IV 8 + ICV 16; ESP pads payload+2 to a multiple of 4)
+mtu_fit() {
+  local avail=$(( $1 - 20 - 8 - 8 - 16 ))
+  [[ $MODE == udp ]] && avail=$(( avail - 8 ))
+  echo $(( avail / 4 * 4 - 2 ))
+}
+
+# sets MTU: the manual value, otherwise the safe default - lowered when the WAN link MTU is small
+calc_mtu() {
+  local base wmtu="" fit
+  if [[ $MODE == udp ]]; then base=$MTU_UDP; else base=$MTU_ESP; fi
+  if [[ ${MTU_SET:-0} =~ ^[0-9]+$ ]] && (( MTU_SET >= 576 )); then MTU=$MTU_SET; return 0; fi
+  MTU=$base
+  [[ -r /sys/class/net/${WAN_DEV}/mtu ]] && wmtu=$(<"/sys/class/net/${WAN_DEV}/mtu")
+  if [[ $wmtu =~ ^[0-9]+$ ]]; then
+    fit=$(mtu_fit "$wmtu")
+    (( fit < MTU )) && MTU=$fit
+  fi
+  (( MTU < 576 )) && MTU=576
+  return 0
+}
+
+# ---- network tuning (BBR, bigger buffers ...) ----------------------------------
+TUNE_KEYS="net.core.default_qdisc net.ipv4.tcp_congestion_control net.core.rmem_max net.core.wmem_max net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.core.netdev_max_backlog net.ipv4.tcp_mtu_probing net.ipv4.tcp_slow_start_after_idle net.netfilter.nf_conntrack_max"
+
+tune_save_orig() {   # remember this server's values before the first change
+  local k v
+  [[ -f $TUNE_ORIG ]] && return 0
+  mkdir -p "$CONF_DIR"
+  for k in $TUNE_KEYS; do
+    v=$(sysctl -n "$k" 2>/dev/null) || continue
+    printf '%s=%s\n' "$k" "$v"
+  done > "$TUNE_ORIG"
+}
+
+tune_restore() {     # put the original values back (tuning switched off / uninstall)
+  local k v
+  [[ -f $TUNE_ORIG ]] || return 0
+  while IFS='=' read -r k v; do
+    [[ -n $k ]] && sysctl -qw "${k}=${v}" >/dev/null 2>&1
+  done < "$TUNE_ORIG"
+  rm -f "$TUNE_ORIG"
+}
+
+tune_wanted() {      # "key value" for every setting this server should have - never lowers a value
+  local cur a b c k
+  modprobe -q tcp_bbr 2>/dev/null
+  if grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+    echo "net.core.default_qdisc fq"
+    echo "net.ipv4.tcp_congestion_control bbr"
+  fi
+  for k in net.core.rmem_max net.core.wmem_max; do
+    cur=$(sysctl -n "$k" 2>/dev/null)
+    [[ $cur =~ ^[0-9]+$ ]] || continue
+    (( cur < 16777216 )) && cur=16777216
+    echo "$k $cur"
+  done
+  for k in net.ipv4.tcp_rmem net.ipv4.tcp_wmem; do
+    read -r a b c <<< "$(sysctl -n "$k" 2>/dev/null)"
+    [[ $c =~ ^[0-9]+$ ]] || continue
+    (( c < 16777216 )) && c=16777216
+    echo "$k $a $b $c"
+  done
+  cur=$(sysctl -n net.core.netdev_max_backlog 2>/dev/null)
+  if [[ $cur =~ ^[0-9]+$ ]]; then (( cur < 16384 )) && cur=16384; echo "net.core.netdev_max_backlog $cur"; fi
+  cur=$(sysctl -n net.ipv4.tcp_mtu_probing 2>/dev/null)
+  if [[ $cur =~ ^[0-9]+$ ]]; then [[ $cur == 0 ]] && cur=1; echo "net.ipv4.tcp_mtu_probing $cur"; fi
+  if [[ -n $(sysctl -n net.ipv4.tcp_slow_start_after_idle 2>/dev/null) ]]; then echo "net.ipv4.tcp_slow_start_after_idle 0"; fi
+  cur=$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null)
+  if [[ $cur =~ ^[0-9]+$ ]]; then (( cur < 131072 )) && cur=131072; echo "net.netfilter.nf_conntrack_max $cur"; fi
+}
+
 sysctl_apply() {
-  printf 'net.ipv4.ip_forward = 1\n' > "$SYSCTL_FILE"
-  sysctl -qw net.ipv4.ip_forward=1 >/dev/null 2>&1
+  local k v
+  local -a lines=()
+  if [[ $ENGINE == dnat ]]; then                 # only the legacy DNAT engine routes packets
+    lines+=("net.ipv4.ip_forward = 1")
+    sysctl -qw net.ipv4.ip_forward=1 >/dev/null 2>&1
+  fi
+  if [[ ${NET_TUNE:-1} == 1 ]]; then
+    tune_save_orig
+    while read -r k v; do
+      [[ -n $k ]] || continue
+      if sysctl -qw "${k}=${v}" >/dev/null 2>&1; then lines+=("${k} = ${v}"); fi
+    done < <(tune_wanted)
+  fi
+  if (( ${#lines[@]} > 0 )); then printf '%s\n' "${lines[@]}" > "$SYSCTL_FILE"; else rm -f "$SYSCTL_FILE"; fi
   sysctl -qw "net.ipv4.conf.${IF_NAME}.rp_filter=0" >/dev/null 2>&1
   return 0
 }
@@ -596,6 +782,7 @@ iface_setup() {
   fi
   have nmcli && nmcli device set "$IF_NAME" managed no >/dev/null 2>&1
   ip addr add "${LOCAL_INNER}/${NET_PREFIX}" dev "$IF_NAME" || { log "ERROR: cannot set $LOCAL_INNER on $IF_NAME"; return 1; }
+  calc_mtu
   ip link set "$IF_NAME" mtu "$MTU" up            || { log "ERROR: cannot bring $IF_NAME up"; return 1; }
   return 0
 }
@@ -737,9 +924,22 @@ udp_helper_start() {   # holds the UDP socket that lets the kernel decapsulate E
   return 1
 }
 
-teardown_all() {
+# true when OUR helper is alive and was started for the configured UDP port
+udp_helper_alive() {
+  local pid cl
+  [[ -f $UDP_PID_FILE ]] || return 1
+  pid=$(<"$UDP_PID_FILE")
+  [[ $pid =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  cl=$({ tr '\0' ' ' < "/proc/${pid}/cmdline"; } 2>/dev/null)
+  [[ $cl == *ESPT* && $cl =~ [[:space:]]${UDP_PORT}[[:space:]]*$ ]]
+}
+
+udp_helper_ensure() { udp_helper_alive && return 0; udp_helper_start; }
+
+teardown_all() {   # teardown_all [keep-helper]  - a rebuild keeps the UDP socket: no gap for incoming ESP
   fw_remove
-  udp_helper_stop
+  [[ ${1:-} == keep-helper ]] || udp_helper_stop
   sa_flush
   policies_remove
   ip link del "$IF_NAME" 2>/dev/null
@@ -747,7 +947,7 @@ teardown_all() {
 }
 
 setup_all() {
-  teardown_all
+  teardown_all keep-helper
   mkdir -p "$RUN_DIR"; : > "$REG"
   load_modules
   route_info "$PEER_PUB" || { log "ERROR: no route to peer $PEER_PUB"; return 1; }
@@ -755,7 +955,7 @@ setup_all() {
   policies_setup         || return 1
   CUR_EPOCH=$(( $(date +%s) / EPOCH_LEN ))
   install_epoch "$CUR_EPOCH" || return 1
-  if [[ $MODE == udp ]]; then udp_helper_start || return 1; fi
+  if [[ $MODE == udp ]]; then udp_helper_ensure || return 1; fi
   sysctl_apply
   fw_apply
   log "tunnel up: role=$ROLE ${LOCAL_INNER} <-> ${PEER_INNER}  transport=$MODE  engine=$ENGINE  local=$LOCAL_ADDR($WAN_DEV) peer=$PEER_PUB mtu=$MTU epoch=$CUR_EPOCH"
@@ -763,97 +963,108 @@ setup_all() {
 }
 
 # ------------------------------------------------------------------------------
-#  Rathole core: download, config, service
+#  Backhaul core: download, config, service
 # ------------------------------------------------------------------------------
-rh_arch() {   # asset suffix of the official release for this CPU
+bh_arch() {   # asset suffix of the official release for this CPU (backhaul_linux_<arch>.tar.gz)
   case $(uname -m) in
-    x86_64|amd64)  echo "x86_64-unknown-linux-gnu" ;;
-    aarch64|arm64) echo "aarch64-unknown-linux-musl" ;;
-    armv7l|armv7)  echo "armv7-unknown-linux-musleabihf" ;;
+    x86_64|amd64)  echo "amd64" ;;
+    aarch64|arm64) echo "arm64" ;;
     *) return 1 ;;
   esac
 }
 
-rh_works() { [[ -x $1 ]] && "$1" --version >/dev/null 2>&1; }
+# a Go binary: -v prints the version; -h / --version are fallbacks for other builds
+bh_works() {
+  [[ -x $1 ]] || return 1
+  "$1" -v >/dev/null 2>&1 || "$1" --version >/dev/null 2>&1 || "$1" -h >/dev/null 2>&1
+}
 
-rh_version() { "$RH_BIN" --version 2>/dev/null | awk '/Build Version/{print $3; exit}'; }
+bh_version() {
+  local v
+  v=$("$BH_BIN" -v 2>&1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)*' | head -n1)
+  echo "${v:-?}"
+}
 
 # latest release tag WITHOUT the rate-limited GitHub API (follows the /releases/latest redirect)
-rh_latest_tag() {
+bh_latest_tag() {
   local tag
   have curl || return 1
-  tag=$(curl -fsSL --max-time 15 -o /dev/null -w '%{url_effective}' "https://github.com/${RH_REPO}/releases/latest" 2>/dev/null | sed 's#.*/tag/##')
+  tag=$(curl -fsSL --max-time 15 -o /dev/null -w '%{url_effective}' "https://github.com/${BH_REPO}/releases/latest" 2>/dev/null | sed 's#.*/tag/##')
   [[ $tag =~ ^v[0-9]+(\.[0-9]+)+$ ]] && echo "$tag"
 }
 
-rh_install_from() {   # rh_install_from <zip-or-binary>  -> $RH_BIN
-  local f=$1 tmp
+bh_install_from() {   # bh_install_from <tar.gz-or-binary>  -> $BH_BIN
+  local f=$1 tmp magic
   [[ -f $f ]] || { err "File not found: $f"; return 1; }
   tmp=$(mktemp -d)
-  if [[ $(head -c2 "$f" 2>/dev/null) == PK ]]; then
-    unzip -o -q "$f" -d "$tmp" 2>/dev/null || { err "Cannot unzip $f"; rm -rf "$tmp"; return 1; }
-    f=$(find "$tmp" -type f -name rathole | head -n1)
-    [[ -n $f ]] || { err "No 'rathole' binary inside the archive."; rm -rf "$tmp"; return 1; }
+  magic=$(head -c2 "$f" 2>/dev/null | od -An -tx1 | tr -d ' \n')
+  if [[ $magic == 1f8b ]]; then                       # gzip -> the official release archive
+    tar -xzf "$f" -C "$tmp" 2>/dev/null || { err "Cannot extract $f"; rm -rf "$tmp"; return 1; }
+    f=$(find "$tmp" -type f -name backhaul | head -n1)
+    [[ -n $f ]] || { err "No 'backhaul' binary inside the archive."; rm -rf "$tmp"; return 1; }
   fi
   mkdir -p "$LIB_DIR"
-  install -m 755 "$f" "${RH_BIN}.new" || { rm -rf "$tmp"; return 1; }
+  install -m 755 "$f" "${BH_BIN}.new" || { rm -rf "$tmp"; return 1; }
   rm -rf "$tmp"
-  if ! rh_works "${RH_BIN}.new"; then
-    rm -f "${RH_BIN}.new"
-    err "This rathole binary does not run on this system (wrong CPU, or glibc too old)."
+  if ! bh_works "${BH_BIN}.new"; then
+    rm -f "${BH_BIN}.new"
+    err "This backhaul binary does not run on this system (wrong CPU, or not a Linux build)."
     return 1
   fi
-  mv -f "${RH_BIN}.new" "$RH_BIN"      # atomic: safe even while the old binary is running
+  mv -f "${BH_BIN}.new" "$BH_BIN"      # atomic: safe even while the old binary is running
 }
 
-rh_fetch() {   # rh_fetch <url> -> installs it
+bh_fetch() {   # bh_fetch <url> -> installs it
   local tmp rc
   tmp=$(mktemp)
-  curl -fL -sS --retry 2 --connect-timeout 10 --max-time 180 -o "$tmp" "$1" && rh_install_from "$tmp"
+  curl -fL -sS --retry 2 --connect-timeout 10 --max-time 180 -o "$tmp" "$1" && bh_install_from "$tmp"
   rc=$?
   rm -f "$tmp"
   return $rc
 }
 
-# ensure_rathole [force]   force = download again even if a core is already installed
-ensure_rathole() {
+# ensure_backhaul [force]   force = download again even if a core is already installed
+ensure_backhaul() {
   local force=${1:-} tag arch ans
-  if [[ -z $force ]] && rh_works "$RH_BIN"; then
-    ok "rathole core is already installed (v$(rh_version))."
+  if [[ -z $force ]] && bh_works "$BH_BIN"; then
+    ok "Backhaul core is already installed (v$(bh_version))."
     return 0
   fi
-  # a rathole that another script already put on this server can be reused - handy when GitHub is blocked
-  if [[ -z $force ]] && have rathole && rh_install_from "$(command -v rathole)"; then
-    ok "Reused the rathole found in PATH (v$(rh_version))."
+  # a backhaul that another script already put on this server can be reused - handy when GitHub is blocked
+  if [[ -z $force ]] && have backhaul && bh_install_from "$(command -v backhaul)"; then
+    ok "Reused the backhaul found in PATH (v$(bh_version))."
     return 0
   fi
-  arch=$(rh_arch) || { err "Unsupported CPU architecture: $(uname -m)"; return 1; }
-  tag=$(rh_latest_tag)
-  if [[ -n $tag ]]; then
-    info "Downloading rathole ${tag} (${arch})..."
-    if rh_fetch "https://github.com/${RH_REPO}/releases/download/${tag}/rathole-${arch}.zip"; then
-      ok "rathole ${tag} installed."; return 0
+  if arch=$(bh_arch); then
+    tag=$(bh_latest_tag)
+    if [[ -n $tag ]]; then
+      info "Downloading Backhaul ${tag} (linux ${arch})..."
+      if bh_fetch "https://github.com/${BH_REPO}/releases/download/${tag}/backhaul_linux_${arch}.tar.gz"; then
+        ok "Backhaul ${tag} installed."; return 0
+      fi
     fi
-  fi
-  if [[ $tag != "$RH_FALLBACK_TAG" ]]; then
-    info "Trying rathole ${RH_FALLBACK_TAG}..."
-    if rh_fetch "https://github.com/${RH_REPO}/releases/download/${RH_FALLBACK_TAG}/rathole-${arch}.zip"; then
-      ok "rathole ${RH_FALLBACK_TAG} installed."; return 0
+    if [[ $tag != "$BH_FALLBACK_TAG" ]]; then
+      info "Trying Backhaul ${BH_FALLBACK_TAG}..."
+      if bh_fetch "https://github.com/${BH_REPO}/releases/download/${BH_FALLBACK_TAG}/backhaul_linux_${arch}.tar.gz"; then
+        ok "Backhaul ${BH_FALLBACK_TAG} installed."; return 0
+      fi
     fi
+    warn "Could not download Backhaul (is GitHub reachable from this server?)."
+  else
+    warn "No official Backhaul build for this CPU architecture ($(uname -m))."
   fi
-  warn "Could not download rathole (is GitHub reachable from this server?)."
-  echo "Give a direct URL (a mirror) or a local path to a rathole zip/binary you uploaded (scp), or press Enter to abort."
+  echo "Give a direct URL (a mirror) or a local path to a backhaul .tar.gz / binary you uploaded (scp), or press Enter to abort."
   read -r -p "URL or path: " ans
   [[ -n $ans ]] || return 1
-  if [[ $ans =~ ^https?:// ]]; then rh_fetch "$ans"; else rh_install_from "$ans"; fi || return 1
-  ok "rathole installed (v$(rh_version))."
+  if [[ $ans =~ ^https?:// ]]; then bh_fetch "$ans"; else bh_install_from "$ans"; fi || return 1
+  ok "Backhaul installed (v$(bh_version))."
   return 0
 }
 
-# ports that are already listening on this server (rathole of THIS tunnel excluded)
+# ports that are already listening on this server (Backhaul of THIS tunnel excluded)
 busy_ports() {   # busy_ports "<norm ports>" -> space separated list
   local mp used p
-  mp=$(systemctl show -p MainPID --value "$RH_UNIT" 2>/dev/null); mp=${mp:-0}
+  mp=$(systemctl show -p MainPID --value "$BH_UNIT" 2>/dev/null); mp=${mp:-0}
   used=$(ss -Hltunp 2>/dev/null | awk -v mp="$mp" '
     mp != 0 && index($0, "pid=" mp ",") { next }
     { n = split($5, a, ":"); print a[n] }' | sort -u)
@@ -863,78 +1074,124 @@ busy_ports() {   # busy_ports "<norm ports>" -> space separated list
   return 0
 }
 
-rh_write_config() {
-  local p pr
-  local -a protos=() plist=()
-  [[ -n $RH_AUTH && -n $PORTS ]] || { log "ERROR: rathole config needs the master key and a port list"; return 1; }
-  case $FWD_PROTO in tcp) protos=(tcp) ;; udp) protos=(udp) ;; *) protos=(tcp udp) ;; esac
-  mapfile -t plist < <(expand_ports "$PORTS")
+# the "ports = [...]" array of the Iran (server) config. Without a custom target the list is written as
+# given (single ports and ranges, forwarded to the same port on the Kharej side). With a custom target
+# address every port becomes an explicit "port=target:port" mapping.
+bh_ports_toml() {
+  local spec p i n
+  local -a specs=() items=()
+  if [[ ${BH_TARGET:-127.0.0.1} == 127.0.0.1 ]]; then
+    IFS=',' read -ra specs <<< "$PORTS"
+    for spec in "${specs[@]}"; do
+      [[ -n $spec ]] && items+=("\"${spec}\"")
+    done
+  else
+    for p in $(expand_ports "$PORTS"); do
+      items+=("\"${p}=${BH_TARGET}:${p}\"")
+    done
+  fi
+  n=${#items[@]}
+  echo "ports = ["
+  for (( i = 0; i < n; i++ )); do
+    if (( i < n - 1 )); then echo "${items[i]},"; else echo "${items[i]}"; fi
+  done
+  echo "]"
+}
+
+bh_mux_toml() {   # SMUX settings shared by tcpmux / wsmux / wssmux (the key name is spelled this way upstream)
+  echo "mux_version = 1"
+  echo "mux_framesize = 32768"
+  echo "mux_recievebuffer = 4194304"
+  echo "mux_streambuffer = 65536"
+}
+
+# wss / wssmux: self-signed certificate on the Iran server (the Backhaul client does not verify it)
+bh_tls_ensure() {
+  [[ -s $BH_CRT && -s $BH_KEY ]] && return 0
+  have openssl || { log "ERROR: openssl is needed for the ${BH_TRANSPORT} transport (apt install openssl)"; return 1; }
+  mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR"
+  (
+    umask 077
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout "$BH_KEY" -out "$BH_CRT" -days 3650 -subj "/CN=${IP_IRAN}" >/dev/null 2>&1
+  ) || { log "ERROR: cannot create the TLS certificate"; rm -f "$BH_KEY" "$BH_CRT"; return 1; }
+  chmod 600 "$BH_KEY" "$BH_CRT"
+  log "created a self-signed TLS certificate for ${BH_TRANSPORT}: ${BH_CRT}"
+  return 0
+}
+
+bh_write_config() {
+  [[ -n $BH_AUTH ]] || { log "ERROR: backhaul config needs the master key"; return 1; }
+  if [[ $ROLE == iran ]]; then
+    [[ -n $PORTS ]] || { log "ERROR: backhaul server config needs a port list"; return 1; }
+    if [[ $BH_TRANSPORT == wss || $BH_TRANSPORT == wssmux ]]; then bh_tls_ensure || return 1; fi
+  fi
   mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR"
   (
     umask 077
     {
+      echo "# generated by ${APP} - changes are overwritten"
       if [[ $ROLE == iran ]]; then
-        cat <<EOF
-# generated by ${APP} - changes are overwritten
-[server]
-bind_addr = "${LOCAL_INNER}:${RH_PORT}"
-default_token = "${RH_AUTH}"
-heartbeat_interval = ${RH_HB_INTERVAL}
-
-[server.transport]
-type = "tcp"
-
-[server.transport.tcp]
-nodelay = true
-keepalive_secs = 20
-keepalive_interval = 8
-EOF
-        for pr in "${protos[@]}"; do
-          for p in "${plist[@]}"; do
-            printf '\n[server.services.%s_%s]\ntype = "%s"\nbind_addr = "0.0.0.0:%s"\n' "$pr" "$p" "$pr" "$p"
-          done
-        done
+        echo "[server]"
+        echo "bind_addr = \"${LOCAL_INNER}:${BH_PORT}\""
+        echo "transport = \"${BH_TRANSPORT}\""
+        echo "token = \"${BH_AUTH}\""
+        echo "heartbeat = ${BH_HB_INTERVAL}"
+        echo "channel_size = 2048"
+        if [[ $BH_TRANSPORT != udp ]]; then
+          echo "keepalive_period = 20"
+          echo "nodelay = true"
+        fi
+        # UDP inside the TCP tunnel exists for the plain tcp transport only
+        if [[ $BH_TRANSPORT == tcp && $FWD_PROTO != tcp ]]; then echo "accept_udp = true"; fi
+        if [[ $BH_TRANSPORT == *mux ]]; then
+          echo "mux_con = 8"
+          bh_mux_toml
+        fi
+        if [[ $BH_TRANSPORT == wss || $BH_TRANSPORT == wssmux ]]; then
+          echo "tls_cert = \"${BH_CRT}\""
+          echo "tls_key = \"${BH_KEY}\""
+        fi
+        echo "sniffer = false"
+        echo "web_port = 0"
+        echo "log_level = \"info\""
+        bh_ports_toml
       else
-        cat <<EOF
-# generated by ${APP} - changes are overwritten
-[client]
-remote_addr = "${PEER_INNER}:${RH_PORT}"
-default_token = "${RH_AUTH}"
-heartbeat_timeout = ${RH_HB_TIMEOUT}
-retry_interval = 1
-
-[client.transport]
-type = "tcp"
-
-[client.transport.tcp]
-nodelay = true
-keepalive_secs = 20
-keepalive_interval = 8
-EOF
-        for pr in "${protos[@]}"; do
-          for p in "${plist[@]}"; do
-            printf '\n[client.services.%s_%s]\ntype = "%s"\nlocal_addr = "%s:%s"\n' "$pr" "$p" "$pr" "$RH_TARGET" "$p"
-          done
-        done
+        echo "[client]"
+        echo "remote_addr = \"${PEER_INNER}:${BH_PORT}\""
+        echo "transport = \"${BH_TRANSPORT}\""
+        echo "token = \"${BH_AUTH}\""
+        echo "connection_pool = 8"
+        echo "aggressive_pool = false"
+        if [[ $BH_TRANSPORT != udp ]]; then
+          echo "keepalive_period = 20"
+          echo "dial_timeout = 10"
+          echo "nodelay = true"
+        fi
+        echo "retry_interval = 1"
+        if [[ $BH_TRANSPORT == *mux ]]; then bh_mux_toml; fi
+        echo "sniffer = false"
+        echo "web_port = 0"
+        echo "log_level = \"info\""
       fi
-    } > "${RH_CONF}.new"
+    } > "${BH_CONF}.new"
   )
-  chmod 600 "${RH_CONF}.new" && mv -f "${RH_CONF}.new" "$RH_CONF"
+  chmod 600 "${BH_CONF}.new" && mv -f "${BH_CONF}.new" "$BH_CONF"
 }
 
-write_rh_unit() {
-  cat > "$RH_UNIT_FILE" <<EOF
+write_bh_unit() {
+  cat > "$BH_UNIT_FILE" <<EOF
 [Unit]
-Description=Rathole reverse tunnel over the ESP tunnel (${APP})
+Description=Backhaul reverse tunnel over the ESP tunnel (${APP})
 After=network-online.target ${APP}.service
 Requires=${APP}.service
 StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-ExecStart=${BIN} rh-run
+ExecStart=${BIN} bh-run
 Restart=always
 RestartSec=3
+OOMScoreAdjust=-500
 LimitNOFILE=1048576
 
 [Install]
@@ -942,52 +1199,66 @@ WantedBy=multi-user.target
 EOF
 }
 
-# runs under systemd: wait for the tunnel address, then become rathole
-cmd_rh_run() {
+# units of the old Rathole engine (esp-tunnel 2.0 - 2.3) are switched off and removed
+legacy_rathole_cleanup() {
+  local u="${APP}-rathole"
+  if [[ -f /etc/systemd/system/${u}.service ]]; then
+    systemctl disable --now "$u" >/dev/null 2>&1
+    rm -f "/etc/systemd/system/${u}.service"
+    systemctl daemon-reload
+  fi
+  return 0
+}
+
+# runs under systemd: wait for the tunnel address, then become backhaul
+cmd_bh_run() {
   local mode
   load_config || { log "ERROR: missing or invalid $CONF"; exit 1; }
-  [[ $ENGINE == rathole ]] || { log "ERROR: engine is '$ENGINE', not rathole"; exit 1; }
-  rh_works "$RH_BIN" || { log "ERROR: rathole core missing at $RH_BIN (menu option 10)"; exit 1; }
-  [[ -s $RH_CONF ]] || rh_write_config || exit 1
+  [[ $ENGINE == backhaul ]] || { log "ERROR: engine is '$ENGINE', not backhaul"; exit 1; }
+  bh_works "$BH_BIN" || { log "ERROR: backhaul core missing at $BH_BIN (menu option 10)"; exit 1; }
+  [[ -s $BH_CONF ]] || bh_write_config || exit 1
   for _ in $(seq 1 60); do
     ip -4 addr show dev "$IF_NAME" 2>/dev/null | grep -q "inet ${LOCAL_INNER}/" && break
     sleep 1
   done
-  if [[ $ROLE == iran ]]; then mode=--server; else mode=--client; fi
-  log "[rathole] starting as ${ROLE} (${mode#--}), control ${IP_IRAN}:${RH_PORT}, core v$(rh_version)"
-  exec "$RH_BIN" "$mode" "$RH_CONF"
+  if [[ $ROLE == iran ]]; then mode=server; else mode=client; fi
+  log "[backhaul] starting as ${ROLE} (${mode}), transport ${BH_TRANSPORT}, control ${IP_IRAN}:${BH_PORT}, core v$(bh_version)"
+  exec "$BH_BIN" -c "$BH_CONF"
 }
 
-start_rathole() {
-  if [[ $ENGINE != rathole ]]; then
-    systemctl disable --now "$RH_UNIT" >/dev/null 2>&1
-    rm -f "$RH_UNIT_FILE"
+start_backhaul() {
+  legacy_rathole_cleanup
+  if [[ $ENGINE != backhaul ]]; then
+    systemctl disable --now "$BH_UNIT" >/dev/null 2>&1
+    rm -f "$BH_UNIT_FILE"
     return 0
   fi
-  rh_works "$RH_BIN" || { err "rathole core is missing - use menu option 10."; return 1; }
-  rh_write_config    || return 1
-  write_rh_unit
+  bh_works "$BH_BIN" || { err "Backhaul core is missing - use menu option 10."; return 1; }
+  bh_write_config    || return 1
+  write_bh_unit
   systemctl daemon-reload
-  systemctl enable "$RH_UNIT" >/dev/null 2>&1
-  systemctl restart "$RH_UNIT"
+  systemctl enable "$BH_UNIT" >/dev/null 2>&1
+  systemctl restart "$BH_UNIT"
   sleep 2
-  if systemctl is-active --quiet "$RH_UNIT"; then
-    ok "Rathole reverse-tunnel service is running."
+  if systemctl is-active --quiet "$BH_UNIT"; then
+    ok "Backhaul reverse-tunnel service is running (transport: ${BH_TRANSPORT})."
     return 0
   fi
-  err "Rathole service failed to start. Last log lines:"
-  journalctl -u "$RH_UNIT" -n 25 --no-pager
+  err "Backhaul service failed to start. Last log lines:"
+  journalctl -u "$BH_UNIT" -n 25 --no-pager
   return 1
 }
 
-# number of established TCP connections on the rathole control port (control + data channels)
-rh_conn_count() {
-  ss -Htn state established 2>/dev/null | awk -v a="${IP_IRAN}:${RH_PORT}" \
+# number of established TCP connections on the Backhaul control port (control + data channels).
+# The udp transport has no TCP sessions to count: "n/a"
+bh_conn_count() {
+  if [[ $BH_TRANSPORT == udp ]]; then echo "n/a"; return 0; fi
+  ss -Htn state established 2>/dev/null | awk -v a="${IP_IRAN}:${BH_PORT}" \
     '{for(i=1;i<=NF;i++) if($i==a){c++; break}} END{print c+0}'
 }
 
-# "<ports listening>/<ports configured>" on the Iran server (rathole opens a port only while the client is connected)
-rh_listen_summary() {
+# "<ports listening>/<ports configured>" on the Iran server
+bh_listen_summary() {
   local used p n=0 t=0
   used=$(ss -Hltun 2>/dev/null | awk '{k=split($5,a,":"); print a[k]}' | sort -u)
   for p in $(expand_ports "$PORTS"); do
@@ -997,13 +1268,15 @@ rh_listen_summary() {
   echo "$n/$t"
 }
 
-# after an ESP rebuild the tunnel address is recreated - make sure the rathole server still listens on it
-rh_post_rebuild() {
-  [[ $ENGINE == rathole && $ROLE == iran ]] || return 0
-  systemctl is-active --quiet "$RH_UNIT" 2>/dev/null || return 0
-  if ! ss -Hltn "sport = :${RH_PORT}" 2>/dev/null | grep -q "${LOCAL_INNER}:${RH_PORT}"; then
-    log "rathole control listener missing after the rebuild - restarting rathole"
-    systemctl restart --no-block "$RH_UNIT"
+# after an ESP rebuild the tunnel address is recreated - make sure the Backhaul server still listens on it
+bh_post_rebuild() {
+  local fl=-Hltn
+  [[ $ENGINE == backhaul && $ROLE == iran ]] || return 0
+  systemctl is-active --quiet "$BH_UNIT" 2>/dev/null || return 0
+  [[ $BH_TRANSPORT == udp ]] && fl=-Hlun
+  if ! ss "$fl" "sport = :${BH_PORT}" 2>/dev/null | grep -q "${LOCAL_INNER}:${BH_PORT}"; then
+    log "backhaul control listener missing after the rebuild - restarting backhaul"
+    systemctl restart --no-block "$BH_UNIT"
   fi
 }
 
@@ -1065,7 +1338,8 @@ watchdog_rebuild() {   # watchdog_rebuild "<reason>" [skip-forensic]
   fi
   if route_info "$PEER_PUB" && setup_all; then
     log "rebuild complete"
-    rh_post_rebuild
+    xfrm_baseline
+    bh_post_rebuild
   else
     log "ERROR: rebuild attempt failed, will retry next cycle"
   fi
@@ -1093,19 +1367,41 @@ watchdog_rebuild() {   # watchdog_rebuild "<reason>" [skip-forensic]
 # ------------------------------------------------------------------------------
 #  Daemon (runs under systemd): setup, hourly key rotation, health watchdog
 # ------------------------------------------------------------------------------
+# policy / state counts right after a (re)build: the self-check later compares against THESE
+# numbers, so a different `ip xfrm` output format can never cause false rebuilds
+xfrm_baseline() {
+  BASE_POL=$(ip xfrm policy 2>/dev/null | grep -cE "^src (${IP_IRAN}|${IP_KHAREJ})/32")
+  BASE_SA=$(ip xfrm state 2>/dev/null | grep -cE "^src (${LOCAL_ADDR}|${PEER_PUB}) dst (${LOCAL_ADDR}|${PEER_PUB})")
+}
+
+# SIGHUP: re-read the settings that may change at run time (no restart -> connections survive)
+wd_reload() {
+  local v
+  v=$(bash -c 'source "$1" >/dev/null 2>&1; echo "${FORCE_REBUILD_SEC:-x} ${RX_STALL_SEC:-x} ${MTU_SET:-0} ${NET_TUNE:-1} ${BH_TRANSPORT:-tcp}"' _ "$CONF" 2>/dev/null)
+  read -r FORCE_REBUILD_SEC RX_STALL_SEC MTU_SET NET_TUNE BH_TRANSPORT <<< "$v"
+  [[ $FORCE_REBUILD_SEC =~ ^[0-9]+$ ]] || FORCE_REBUILD_SEC=$DEFAULT_FORCE_REBUILD_SEC
+  [[ $RX_STALL_SEC =~ ^[0-9]+$ ]]      || RX_STALL_SEC=$DEFAULT_RX_STALL_SEC
+  [[ $MTU_SET =~ ^[0-9]+$ ]]           || MTU_SET=0
+  [[ $NET_TUNE == 0 ]]                 || NET_TUNE=1
+  valid_bh_transport "$BH_TRANSPORT"   || BH_TRANSPORT=$DEFAULT_BH_TRANSPORT
+  log "settings reloaded: rx-stall ${RX_STALL_SEC}s, preventive rebuild ${FORCE_REBUILD_SEC}s, mtu-set ${MTU_SET}, tuning ${NET_TUNE}, backhaul transport ${BH_TRANSPORT}"
+}
+
 cmd_daemon() {
-  local tries=0 last_fix=0 e now xcur tick=0
+  local tries=0 last_fix=0 last_xwarn=0 e now xcur tick=0 rate la wd chk n_pol n_sa
   load_config || { log "ERROR: missing or invalid $CONF"; exit 1; }
   mkdir -p "$RUN_DIR"
   trap 'log "stop signal received"; exit 0' TERM INT
+  trap 'wd_reload' HUP
 
   until route_info "$PEER_PUB"; do
     (( ++tries > 30 )) && { log "ERROR: no route to $PEER_PUB after 60s"; exit 1; }
     sleep 2
   done
   setup_all || { log "ERROR: setup failed"; exit 1; }
+  xfrm_baseline
   printf -v LAST_REBUILD '%(%s)T' -1
-  read_counters; RX0=$CNT_RX; TX0=$CNT_TX
+  read_counters; RX0=$CNT_RX; TX0=$CNT_TX; PREV_BYTES=$(( CNT_RX + CNT_TX ))
   XPREV=$(xfrm_nonzero_counters)
   EVER_UP=0
   log "watchdog active: rx-stall trigger ${RX_STALL_SEC}s, preventive rebuild $( (( FORCE_REBUILD_SEC > 0 )) && echo "every $((FORCE_REBUILD_SEC/3600))h" || echo disabled)"
@@ -1116,18 +1412,25 @@ cmd_daemon() {
     wait $!
     printf -v now '%(%s)T' -1
     tick=$(( tick + 1 ))
+    read_counters
+    rate=$(( CNT_RX + CNT_TX - PREV_BYTES )); PREV_BYTES=$(( CNT_RX + CNT_TX ))   # bytes since the last cycle
+    (( rate < 0 )) && rate=0
 
     # --- hourly key rotation (make-before-break, no packet loss) ---
     e=$(( now / EPOCH_LEN ))
     if (( e != CUR_EPOCH )); then
       log "key rotation: epoch $CUR_EPOCH -> $e"
-      if install_epoch "$e"; then CUR_EPOCH=$e; else log "WARN: key rotation failed, will retry"; fi
+      if install_epoch "$e"; then CUR_EPOCH=$e; xfrm_baseline; else log "WARN: key rotation failed, will retry"; fi
     fi
 
-    # --- unconditional preventive rebuild (the "every 12h" safety net) ---
+    # --- preventive rebuild (the "every 12h" safety net) - waits for a quiet moment, at most 1 h ---
     if (( FORCE_REBUILD_SEC > 0 && now - LAST_REBUILD >= FORCE_REBUILD_SEC )); then
-      watchdog_rebuild "scheduled preventive rebuild (every $((FORCE_REBUILD_SEC/3600))h)" skip-forensic
-      continue
+      if (( rate > 250000 && now - LAST_REBUILD < FORCE_REBUILD_SEC + 3600 )); then
+        (( tick % 12 == 0 )) && log "preventive rebuild postponed: the tunnel is busy (runs when quiet, at the latest in 1 h)"
+      else
+        watchdog_rebuild "scheduled preventive rebuild (every $((FORCE_REBUILD_SEC/3600))h)" skip-forensic
+        continue
+      fi
     fi
 
     # --- interface missing ---
@@ -1136,18 +1439,56 @@ cmd_daemon() {
       continue
     fi
 
-    # --- xfrm kernel error counters (every 30 s): early warning, logged even without a rebuild ---
+    # --- every 30 s: self-healing checks (no need to wait for ping failures) ---
     if (( tick % 6 == 0 )); then
       xcur=$(xfrm_nonzero_counters)
-      if [[ -n $xcur && $xcur != "$XPREV" ]]; then
-        log "WARN: new xfrm error counters: $xcur"
+      if [[ -n $xcur && $xcur != "$XPREV" ]] && (( now - last_xwarn >= 300 )); then
+        log "WARN: xfrm error counters changed: $xcur"
+        last_xwarn=$now
       fi
       XPREV=$xcur
+
+      # firewall rules removed by ufw / firewalld / netfilter-persistent / iptables-restore
+      if ! ipt -C INPUT -j ESPT_IN >/dev/null 2>&1; then
+        log "WARN: the tunnel firewall rules were removed by something else - restoring them"
+        fw_apply
+      fi
+      # the UDP helper holds the encap socket: without it the kernel cannot receive ESP-in-UDP at all
+      if [[ $MODE == udp ]] && ! udp_helper_alive; then
+        log "WARN: the UDP helper is not running - restarting it"
+        udp_helper_start || log "ERROR: cannot restart the UDP helper"
+      fi
+      # local IP / default route / NIC name changed (DHCP renew, failover, rename)
+      la=$LOCAL_ADDR; wd=$WAN_DEV
+      if route_info "$PEER_PUB"; then
+        if [[ $LOCAL_ADDR != "$la" || $WAN_DEV != "$wd" ]]; then
+          watchdog_rebuild "local address/route to the peer changed (${la}/${wd} -> ${LOCAL_ADDR}/${WAN_DEV})" skip-forensic
+          continue
+        fi
+      else
+        LOCAL_ADDR=$la; WAN_DEV=$wd
+      fi
+      # address / policies / states flushed by someone else (compared with the numbers right after the last build)
+      if (( now - LAST_REBUILD >= 60 )); then
+        chk=""
+        ip -4 addr show dev "$IF_NAME" 2>/dev/null | grep -q "inet ${LOCAL_INNER}/" || chk="tunnel address ${LOCAL_INNER} is gone"
+        if [[ -z $chk ]]; then
+          n_pol=$(ip xfrm policy 2>/dev/null | grep -cE "^src (${IP_IRAN}|${IP_KHAREJ})/32")
+          (( n_pol >= BASE_POL )) || chk="xfrm policies were removed (${n_pol}/${BASE_POL})"
+        fi
+        if [[ -z $chk ]]; then
+          n_sa=$(ip xfrm state 2>/dev/null | grep -cE "^src (${LOCAL_ADDR}|${PEER_PUB}) dst (${LOCAL_ADDR}|${PEER_PUB})")
+          (( n_sa >= BASE_SA )) || chk="xfrm states were removed (${n_sa}/${BASE_SA})"
+        fi
+        if [[ -n $chk ]]; then
+          watchdog_rebuild "integrity check: ${chk}" skip-forensic
+          continue
+        fi
+      fi
     fi
 
     # --- asymmetric blackout: outbound flowing, nothing received. Only after the peer has
     #     answered at least once - before that "no inbound" is normal (peer not installed yet) ---
-    read_counters
     if (( EVER_UP && CNT_TX > TX0 && CNT_RX == RX0 )); then
       (( RX_STALL_START == 0 )) && RX_STALL_START=$now
       if (( now - RX_STALL_START >= RX_STALL_SEC && now >= BACKOFF_UNTIL )); then
@@ -1159,17 +1500,22 @@ cmd_daemon() {
     fi
 
     # --- ping watchdog (also exercises the path when otherwise idle) ---
-    if ping -c1 -W1 -I "$IF_NAME" "$PEER_INNER" >/dev/null 2>&1; then
+    if ping -c1 -W2 -I "$IF_NAME" "$PEER_INNER" >/dev/null 2>&1; then
       if [[ $PEER_STATE != up ]]; then log "peer $PEER_INNER reachable - tunnel UP"; fi
       PEER_STATE=up; FAILS=0; EVER_UP=1
       (( UP_SINCE == 0 )) && UP_SINCE=$now
       if (( now - UP_SINCE >= 120 )); then REB_N=0; BACKOFF_UNTIL=0; fi   # stable for 2 min: forget past failures
     else
       UP_SINCE=0
+      (( FAILS == 0 )) && PING_RX0=$CNT_RX
       FAILS=$(( FAILS + 1 ))
       if (( FAILS == 3 )); then PEER_STATE=down; log "peer $PEER_INNER not answering for ~15s"; fi
       if (( FAILS >= 12 )); then
-        if (( now - last_fix >= 180 && now >= BACKOFF_UNTIL )); then
+        if (( CNT_RX - PING_RX0 > 50000 )); then
+          # a saturated link can lose pings while data still flows: a rebuild would only hurt
+          log "pings are lost but real traffic still arrives - the link is alive, not rebuilding"
+          PING_RX0=$CNT_RX
+        elif (( now - last_fix >= 180 && now >= BACKOFF_UNTIL )); then
           last_fix=$now
           if (( EVER_UP || REB_N == 0 )); then
             watchdog_rebuild "peer unreachable (ping) for 60s+"
@@ -1222,6 +1568,7 @@ ExecStart=${BIN} daemon
 ExecStopPost=${BIN} teardown
 Restart=always
 RestartSec=3
+OOMScoreAdjust=-500
 
 [Install]
 WantedBy=multi-user.target
@@ -1244,7 +1591,7 @@ start_service() {
     journalctl -u "$APP" -n 25 --no-pager
     return 1
   fi
-  start_rathole
+  start_backhaul
 }
 
 wait_link() {   # wait_link <seconds>  -> 0 as soon as the peer answers a ping through the tunnel
@@ -1280,14 +1627,14 @@ ask_ports() {
         continue 2
       fi
     done
-    if [[ $ENGINE == rathole ]]; then
+    if [[ $ENGINE == backhaul ]]; then
       cnt=$(expand_ports "$norm" | wc -l)
       if (( cnt > MAX_FWD_PORTS )); then
-        err "$cnt ports requested - rathole needs one service per port, the limit here is $MAX_FWD_PORTS."
+        err "$cnt ports requested - Backhaul opens one listener per port, the limit here is $MAX_FWD_PORTS."
         continue
       fi
-      if ports_include "$norm" "$RH_PORT"; then
-        err "Port $RH_PORT is reserved for the rathole control channel. Remove it."
+      if ports_include "$norm" "$BH_PORT"; then
+        err "Port $BH_PORT is reserved for the Backhaul control channel. Remove it."
         continue
       fi
       if [[ $MODE == udp ]] && ports_include "$norm" "$UDP_PORT"; then
@@ -1296,14 +1643,14 @@ ask_ports() {
       fi
       busy=$(busy_ports "$norm")
       if [[ -n $busy ]]; then
-        err "Already used by a local service on this server: ${busy}- rathole could not open them. Free them or choose other ports."
+        err "Already used by a local service on this server: ${busy}- Backhaul could not open them. Free them or choose other ports."
         continue
       fi
     fi
     PORTS=$norm
     break
   done
-  if [[ $ENGINE != rathole ]]; then
+  if [[ $ENGINE != backhaul ]]; then
     IFS=',' read -ra sp <<< "$PORTS"
     for spec in "${sp[@]}"; do
       [[ $spec == *-* ]] && continue
@@ -1338,29 +1685,82 @@ ask_transport() {
   fi
 }
 
+# Backhaul transport = the protocol of the reverse tunnel that runs INSIDE the ESP tunnel.
+# Chosen on the Iran server; the Kharej side takes it from the token.
+ask_bh_transport() {
+  local c def=1
+  case ${BH_TRANSPORT:-tcp} in
+    tcp) def=1 ;; tcpmux) def=2 ;; udp) def=3 ;; ws) def=4 ;; wss) def=5 ;; wsmux) def=6 ;; wssmux) def=7 ;;
+  esac
+  echo
+  echo "Backhaul transport (the protocol of the reverse tunnel that runs INSIDE the ESP tunnel):"
+  echo "  1) tcp      plain TCP, lowest overhead; the only one that can also carry UDP (default)"
+  echo "  2) tcpmux   TCP + multiplexing (many user connections share a few tunnel connections)"
+  echo "  3) udp      tunnel over UDP"
+  echo "  4) ws       WebSocket"
+  echo "  5) wss      WebSocket + TLS (a self-signed certificate is created automatically)"
+  echo "  6) wsmux    WebSocket + multiplexing"
+  echo "  7) wssmux   WebSocket + TLS + multiplexing"
+  echo "  (the ESP tunnel is already encrypted - the TLS of wss / wssmux only costs extra CPU)"
+  while true; do
+    read -r -p "Select [${def}]: " c
+    case ${c:-$def} in
+      1|tcp)    BH_TRANSPORT=tcp ;;
+      2|tcpmux) BH_TRANSPORT=tcpmux ;;
+      3|udp)    BH_TRANSPORT=udp ;;
+      4|ws)     BH_TRANSPORT=ws ;;
+      5|wss)    BH_TRANSPORT=wss ;;
+      6|wsmux)  BH_TRANSPORT=wsmux ;;
+      7|wssmux) BH_TRANSPORT=wssmux ;;
+      *) err "Invalid choice."; continue ;;
+    esac
+    break
+  done
+  ok "Backhaul transport: ${BH_TRANSPORT}"
+}
+
 ask_fwd_proto() {
   local c
+  if [[ $ENGINE == backhaul ]]; then
+    case $BH_TRANSPORT in
+      tcp)
+        echo
+        echo "Forward which protocol on those ports?"
+        echo "  1) TCP + UDP (default - UDP is carried inside the TCP tunnel)   2) TCP only"
+        echo "  (Backhaul always opens TCP on the listed ports, so there is no 'UDP only' option)"
+        read -r -p "Select [1]: " c
+        case $c in 2) FWD_PROTO=tcp ;; *) FWD_PROTO=both ;; esac
+        ;;
+      udp)
+        FWD_PROTO=both
+        info "UDP transport: what it carries is decided by Backhaul's udp transport - test your service after the install."
+        ;;
+      *)
+        FWD_PROTO=tcp
+        info "The ${BH_TRANSPORT} transport carries TCP only (UDP forwarding needs the tcp transport)."
+        ;;
+    esac
+    return 0
+  fi
   echo
   echo "Forward which protocol on those ports?"
   echo "  1) TCP + UDP (default)   2) TCP only   3) UDP only"
-  if [[ $ENGINE == rathole ]]; then
-    echo "  (rathole carries UDP inside its TCP channel - for latency-sensitive UDP prefer TCP only if you can)"
-  fi
   read -r -p "Select [1]: " c
   case $c in 2) FWD_PROTO=tcp ;; 3) FWD_PROTO=udp ;; *) FWD_PROTO=both ;; esac
 }
 
-# Kharej side: where the forwarded services listen on this server
-ask_rh_target() {
-  local a def=${RH_TARGET:-127.0.0.1}
+# Where the forwarded services listen on the Kharej server. Backhaul keeps the destination in the
+# server (Iran) config, so it is asked on the Iran side and travels in the token.
+ask_bh_target() {
+  local a def=${BH_TARGET:-127.0.0.1}
   echo
-  echo "Where do the forwarded services listen on THIS (Kharej) server?"
+  echo "Where do the forwarded services listen on the KHAREJ server?"
   echo "  127.0.0.1 works for services bound to 127.0.0.1 or 0.0.0.0."
   echo "  Use ${IP_KHAREJ} only if they listen exclusively on the tunnel address."
   while true; do
     read -r -p "Target address [${def}]: " a
     a=${a:-$def}
-    if valid_ip "$a"; then RH_TARGET=$a; return 0; fi
+    if valid_ip "$a"; then BH_TARGET=$a; return 0; fi
     err "Invalid IPv4 address."
   done
 }
@@ -1406,10 +1806,28 @@ udp_probe() {   # udp_probe [count] -> "<replies> <sent> <rtt ms|-> <peer clock 
   python3 -c "$PY_PROBE" "$PEER_PUB" "$UDP_PORT" "${1:-5}" 2>/dev/null
 }
 
+# sets PM_BEST (largest outer packet that got through, 0 = none) and PM_REC (tunnel MTU that fits it)
+pmtu_scan() {
+  local cur s
+  local -a list=()
+  PM_BEST=0; PM_REC=0
+  [[ $MODE == udp ]] && have python3 || return 1
+  cur=$MTU
+  [[ -r /sys/class/net/${IF_NAME}/mtu ]] && cur=$(<"/sys/class/net/${IF_NAME}/mtu")
+  list=($(( cur + 65 )))                      # biggest outer packet this tunnel can create
+  for s in 1500 1480 1460 1440 1420 1400 1380 1360 1340 1300 1280; do
+    (( s < list[0] )) && list+=("$s")
+  done
+  PM_BEST=$(python3 -c "$PY_PMTU" "$PEER_PUB" "$UDP_PORT" "${list[@]}" 2>/dev/null)
+  [[ $PM_BEST =~ ^[0-9]+$ ]] || PM_BEST=0
+  (( PM_BEST > 0 )) && PM_REC=$(mtu_fit "$PM_BEST")
+  return 0
+}
+
 diagnose() {
-  local out loss dev n_pol n_sa k v d x fw_ok rhc
+  local out loss dev n_pol n_sa k v d x fw_ok bhc=""
   local o0=0 i0=0 o1=0 i1=0 r0=0 r1=0 d_out=0 d_in=0 d_rx=0
-  local pr_ok=0 pr_n=5 pr_rtt="-" pr_skew="-" have_probe=0 skew_abs=0 cause="" nz=""
+  local pr_ok=0 pr_n=5 pr_rtt="-" pr_skew="-" have_probe=0 skew_abs=0 cause="" nz="" cur_mtu=0 mtu_warn=""
   local -A XB=()
 
   if ! load_config 2>/dev/null; then warn "Tunnel is not installed."; return; fi
@@ -1443,6 +1861,18 @@ diagnose() {
       if [[ $pr_skew =~ ^-?[0-9]+$ ]]; then
         skew_abs=${pr_skew#-}
         if (( skew_abs > 60 )); then warn "  the two clocks differ by ${pr_skew}s - fix with menu 13 on the server that is wrong"; fi
+      fi
+      # path MTU: a black hole here makes bulk transfers stall or crawl while ping looks fine
+      pmtu_scan
+      cur_mtu=$MTU; [[ -r /sys/class/net/${IF_NAME}/mtu ]] && cur_mtu=$(<"/sys/class/net/${IF_NAME}/mtu")
+      if (( PM_BEST > 0 )); then
+        row "Path MTU" "outer packets up to ${PM_BEST} bytes pass (this direction); tunnel MTU ${cur_mtu}, safe up to ${PM_REC}"
+        if (( PM_REC < cur_mtu )); then
+          mtu_warn="large packets are dropped on the path - set the tunnel MTU to ${PM_REC} (menu 9, press m to measure and apply it)"
+          row "" "${C_Y}${mtu_warn}${C_0}"
+        fi
+      else
+        row "Path MTU" "not measured (no probe size was answered)"
       fi
     else
       row "UDP probe" "${C_R}0/${pr_n} replies - nothing answers on ${PEER_PUB}:${UDP_PORT}/udp${C_0}"
@@ -1482,17 +1912,18 @@ diagnose() {
   else
     row "XFRM errors" "none during the test"
   fi
-  if [[ $ENGINE == rathole ]]; then
-    rhc=$(rh_conn_count)
-    row "Rathole" "service $(systemctl is-active "$RH_UNIT" 2>/dev/null), connections on ${IP_IRAN}:${RH_PORT}: ${rhc}"
+  if [[ $ENGINE == backhaul ]]; then
+    bhc=$(bh_conn_count)
+    row "Backhaul" "service $(systemctl is-active "$BH_UNIT" 2>/dev/null), transport ${BH_TRANSPORT}, connections on ${IP_IRAN}:${BH_PORT}: ${bhc}"
   fi
   echo
 
   if [[ -n $loss ]] && (( loss == 0 )); then
     echo "${C_G}Verdict: the tunnel works (0% packet loss).${C_0}"
-    if [[ $ENGINE == rathole ]] && ( ! systemctl is-active --quiet "$RH_UNIT" 2>/dev/null || (( rhc == 0 )) ); then
-      warn "...but the rathole reverse tunnel is not connected: journalctl -u ${RH_UNIT} -n 30 --no-pager"
+    if [[ $ENGINE == backhaul ]] && { ! systemctl is-active --quiet "$BH_UNIT" 2>/dev/null || [[ $bhc == 0 ]]; }; then
+      warn "...but the Backhaul reverse tunnel is not connected: journalctl -u ${BH_UNIT} -n 30 --no-pager"
     fi
+    [[ -n $mtu_warn ]] && warn "...but ${mtu_warn}"
     return
   fi
 
@@ -1562,13 +1993,14 @@ setup_iran() {
   install_self || { pause; return; }
 
   echo
-  info "Setting up the IRAN server side (tunnel IP ${IP_IRAN}, rathole server)"
-  ENGINE=rathole; RH_PORT=$DEFAULT_RH_PORT; RH_TARGET=127.0.0.1
+  info "Setting up the IRAN server side (tunnel IP ${IP_IRAN}, Backhaul server)"
+  ROLE=iran; ENGINE=backhaul; BH_PORT=$DEFAULT_BH_PORT; BH_TARGET=127.0.0.1
   ask_transport
+  ask_bh_transport
   ensure_deps     || { pause; return; }
   preflight_check || { pause; return; }
   check_kernel    || { pause; return; }
-  ensure_rathole  || { pause; return; }
+  ensure_backhaul || { pause; return; }
   cron_warn
 
   det=$(detect_public_ip)
@@ -1592,6 +2024,7 @@ setup_iran() {
   echo
   ask_ports
   ask_fwd_proto
+  ask_bh_target
 
   ROLE=iran
   MASTER=$(rand_hex 32)
@@ -1602,9 +2035,12 @@ setup_iran() {
   start_service || { pause; return; }
   print_token
   echo
-  echo "Reverse tunnel: the rathole server on this box listens on ${IP_IRAN}:${RH_PORT} (inside the ESP tunnel only)."
-  echo "Public ports [${PORTS}] (${FWD_PROTO}) are opened by rathole and carried through the tunnel to the Kharej server."
-  echo "A port opens only after the Kharej side has connected (run option 2 there with the token above)."
+  echo "Reverse tunnel: the Backhaul server on this box listens on ${IP_IRAN}:${BH_PORT} (inside the ESP tunnel only), transport: ${BH_TRANSPORT}."
+  echo "Public ports [${PORTS}] (${FWD_PROTO}) are opened by Backhaul and carried through the tunnel to ${BH_TARGET}:<same port> on the Kharej server."
+  echo "The Kharej side takes the transport from the token - run option 2 there with the token above."
+  if [[ $BH_TRANSPORT == wss || $BH_TRANSPORT == wssmux ]]; then
+    echo "TLS: a self-signed certificate was created in ${CONF_DIR} (the Kharej client does not verify it)."
+  fi
   if have ufw && ufw status 2>/dev/null | grep -qi '^Status: active'; then
     warn "ufw is active here: allow the forwarded ports too (ufw allow <port>)."
   fi
@@ -1620,18 +2056,19 @@ setup_kharej() {
   install_self || { pause; return; }
 
   echo
-  info "Setting up the KHAREJ client side (tunnel IP ${IP_KHAREJ}, rathole client)"
+  info "Setting up the KHAREJ client side (tunnel IP ${IP_KHAREJ}, Backhaul client)"
   while true; do
     read -r -p "Paste the token from the Iran server: " tok
     if parse_token "$tok"; then break; fi
-    err "Invalid token (copy error?). Copy it again from the Iran server (menu option 8)."
+    err "Invalid token (copy error?). Copy it again from the Iran server (menu option 8). Tokens made by the old Rathole version are not valid - create a new one on the Iran server."
   done
-  MODE=$T_MODE; ENGINE=$T_ENGINE; RH_PORT=$T_RHPORT; RH_TARGET=127.0.0.1
+  ROLE=kharej
+  MODE=$T_MODE; ENGINE=$T_ENGINE; BH_PORT=$T_BHPORT; BH_TRANSPORT=$T_BHTR; BH_TARGET=$T_BHTARGET
   ensure_deps     || { pause; return; }
   preflight_check || { pause; return; }
   check_kernel    || { pause; return; }
-  if [[ $ENGINE == rathole ]]; then
-    ensure_rathole || { pause; return; }
+  if [[ $ENGINE == backhaul ]]; then
+    ensure_backhaul || { pause; return; }
   fi
   cron_warn
 
@@ -1645,7 +2082,9 @@ setup_kharej() {
     warn "This server's local address is $LOCAL_ADDR but the token says $KHAREJ_IP (NAT or wrong server?)."
     confirm "Continue anyway?" n || return
   fi
-  if [[ $ENGINE == rathole ]]; then ask_rh_target; fi
+  if [[ $ENGINE == backhaul ]]; then
+    info "Backhaul transport (from the token): ${BH_TRANSPORT}"
+  fi
 
   write_config
   load_config
@@ -1655,16 +2094,20 @@ setup_kharej() {
   info "Waiting for the tunnel to come up (up to 20 s)..."
   if wait_link 20; then
     ok "Tunnel is UP - ${PEER_INNER} answers ping."
-    if [[ $ENGINE == rathole ]]; then
-      info "Waiting for the rathole reverse tunnel (${IP_KHAREJ} -> ${IP_IRAN}:${RH_PORT})..."
-      for _ in $(seq 1 12); do
-        (( $(rh_conn_count) >= 1 )) && break
-        sleep 1
-      done
-      if (( $(rh_conn_count) >= 1 )); then
-        ok "Reverse tunnel is connected."
+    if [[ $ENGINE == backhaul ]]; then
+      if [[ $BH_TRANSPORT == udp ]]; then
+        info "UDP transport has no connection counter - check the log: journalctl -u ${BH_UNIT} -n 30 --no-pager"
       else
-        warn "Not connected yet. See: journalctl -u ${RH_UNIT} -n 30 --no-pager"
+        info "Waiting for the Backhaul reverse tunnel (${IP_KHAREJ} -> ${IP_IRAN}:${BH_PORT})..."
+        for _ in $(seq 1 12); do
+          [[ $(bh_conn_count) != 0 ]] && break
+          sleep 1
+        done
+        if [[ $(bh_conn_count) != 0 ]]; then
+          ok "Reverse tunnel is connected."
+        else
+          warn "Not connected yet. See: journalctl -u ${BH_UNIT} -n 30 --no-pager"
+        fi
       fi
     fi
   else
@@ -1673,9 +2116,9 @@ setup_kharej() {
     diagnose
   fi
   echo
-  if [[ $ENGINE == rathole ]]; then
-    echo "Ports [${PORTS}] (${FWD_PROTO}) opened on the Iran server are forwarded to ${RH_TARGET}:<same port> on THIS server."
-    echo "The services must be running here and listening on ${RH_TARGET} (or 0.0.0.0)."
+  if [[ $ENGINE == backhaul ]]; then
+    echo "Ports [${PORTS}] (${FWD_PROTO}) opened on the Iran server are forwarded to ${BH_TARGET}:<same port> on THIS server."
+    echo "The services must be running here and listening on ${BH_TARGET} (or 0.0.0.0)."
   else
     echo "Services for ports [${PORTS}] on this server must listen on 0.0.0.0 or ${IP_KHAREJ}."
     echo "Traffic arrives from ${IP_IRAN} (the Iran server's tunnel IP)."
@@ -1686,7 +2129,7 @@ setup_kharej() {
 }
 
 cmd_status() {
-  local st epoch left line st_rh
+  local st epoch left line st_bh
   if ! load_config 2>/dev/null; then
     warn "Tunnel is not installed. Use menu option 1 (Iran) or 2 (Kharej)."
     return
@@ -1700,19 +2143,19 @@ cmd_status() {
   echo "Peer public IP: $PEER_PUB"
   if [[ $MODE == udp ]]; then echo "Transport     : ESP-in-UDP, port $UDP_PORT"
   else echo "Transport     : raw ESP (IP protocol 50)"; fi
-  echo "Cipher        : AES-256-GCM, MTU $MTU, next key rotation in $((left / 60)) min (epoch $epoch)"
+  echo "Cipher        : AES-256-GCM, MTU $(cat "/sys/class/net/${IF_NAME}/mtu" 2>/dev/null || echo "$MTU"), next key rotation in $((left / 60)) min (epoch $epoch)"
   clock_status
   echo "Watchdog      : rx-stall trigger ${RX_STALL_SEC}s, preventive rebuild $( (( FORCE_REBUILD_SEC > 0 )) && echo "every $((FORCE_REBUILD_SEC/3600))h" || echo disabled)"
   if [[ $st == active ]]; then echo "Service       : ${C_G}active${C_0}"; else echo "Service       : ${C_R}${st}${C_0}"; fi
-  if [[ $ENGINE == rathole ]]; then
-    st_rh=$(systemctl is-active "$RH_UNIT" 2>/dev/null)
-    if [[ $st_rh == active ]]; then
-      echo "Rathole       : ${C_G}active${C_0} ($( [[ $ROLE == iran ]] && echo server || echo client ), core v$(rh_version), control ${IP_IRAN}:${RH_PORT}, live connections: $(rh_conn_count))"
+  if [[ $ENGINE == backhaul ]]; then
+    st_bh=$(systemctl is-active "$BH_UNIT" 2>/dev/null)
+    if [[ $st_bh == active ]]; then
+      echo "Backhaul      : ${C_G}active${C_0} ($( [[ $ROLE == iran ]] && echo server || echo client ), transport ${BH_TRANSPORT}, core v$(bh_version), control ${IP_IRAN}:${BH_PORT}, live connections: $(bh_conn_count))"
     else
-      echo "Rathole       : ${C_R}${st_rh}${C_0}"
+      echo "Backhaul      : ${C_R}${st_bh}${C_0}"
     fi
   else
-    echo "Forwarding    : iptables DNAT (legacy engine - re-install to switch to rathole)"
+    echo "Forwarding    : iptables DNAT (legacy engine - re-install to switch to Backhaul)"
   fi
 
   if ip link show "$IF_NAME" >/dev/null 2>&1; then
@@ -1735,13 +2178,14 @@ cmd_status() {
   else
     echo "XFRM counters : clean (no errors)"
   fi
-  if [[ $ENGINE == rathole ]]; then
+  if [[ $ENGINE == backhaul ]]; then
     echo
     echo "--- Forwarded ports (${FWD_PROTO}) : [${PORTS}] ---"
     if [[ $ROLE == iran ]]; then
-      echo "Public ports listening: $(rh_listen_summary)   (a port opens only while the Kharej client is connected)"
+      echo "Public ports listening: $(bh_listen_summary)   (Backhaul may open a port only while the Kharej client is connected)"
+      echo "Target on Kharej      : ${BH_TARGET}"
     else
-      echo "Target on this server : ${RH_TARGET}"
+      echo "Target on this server : ${BH_TARGET}"
     fi
   elif [[ $ROLE == iran ]]; then
     echo
@@ -1780,31 +2224,33 @@ live_log() {
   echo "  2) Live ping monitor (packet loss + latency/jitter through the tunnel)"
   echo "  3) Live traffic counters (kbit/s, pps, errors)"
   echo "  4) Diagnose connection now (same as menu 11)"
-  echo "  5) Rathole log (reverse tunnel)"
+  echo "  5) Backhaul log (reverse tunnel)"
   read -r -p "Select [1]: " c
   case ${c:-1} in
     1) echo "(Ctrl+C to return)"; trap ':' INT; journalctl -u "$APP" -f -n 40 --no-pager; trap - INT ;;
     2) echo "(Ctrl+C to stop and see the summary)"; trap ':' INT; ping -O -i 0.5 -I "$IF_NAME" "$PEER_INNER"; trap - INT ;;
     3) live_counters ;;
     4) diagnose; pause ;;
-    5) if [[ $ENGINE == rathole ]]; then
-         echo "(Ctrl+C to return)"; trap ':' INT; journalctl -u "$RH_UNIT" -f -n 40 --no-pager; trap - INT
+    5) if [[ $ENGINE == backhaul ]]; then
+         echo "(Ctrl+C to return)"; trap ':' INT; journalctl -u "$BH_UNIT" -f -n 40 --no-pager; trap - INT
        else
-         warn "This install does not use rathole."
+         warn "This install does not use Backhaul."
        fi ;;
     *) warn "Invalid choice." ;;
   esac
 }
 
 uninstall_all() {
-  confirm "Remove the tunnel completely (services, rathole core, interface, keys, firewall rules)?" n || return
-  systemctl disable --now "$RH_UNIT" >/dev/null 2>&1
+  confirm "Remove the tunnel completely (services, Backhaul core, interface, keys, firewall rules)?" n || return
+  systemctl disable --now "$BH_UNIT" >/dev/null 2>&1
+  systemctl disable --now "${APP}-rathole" >/dev/null 2>&1       # unit of the old Rathole version, if any
   systemctl disable --now "$APP" >/dev/null 2>&1
   teardown_all
-  rm -f "$UNIT_FILE" "$RH_UNIT_FILE" "$SYSCTL_FILE"
+  tune_restore
+  rm -f "$UNIT_FILE" "$BH_UNIT_FILE" "/etc/systemd/system/${APP}-rathole.service" "$SYSCTL_FILE"
   rm -rf "$CONF_DIR" "$RUN_DIR" "$LIB_DIR"
   systemctl daemon-reload
-  systemctl reset-failed "$APP" "$RH_UNIT" 2>/dev/null
+  systemctl reset-failed "$APP" "$BH_UNIT" "${APP}-rathole" 2>/dev/null
   rm -f "$BIN"
   ok "Tunnel fully removed (net.ipv4.ip_forward was left unchanged)."
 }
@@ -1813,7 +2259,7 @@ change_ports() {
   local tok
   load_config 2>/dev/null || { warn "Tunnel is not installed."; return; }
 
-  if [[ $ENGINE != rathole ]]; then      # legacy iptables engine
+  if [[ $ENGINE != backhaul ]]; then      # legacy iptables engine
     if [[ $ROLE != iran ]]; then warn "Ports are configured on the Iran server only."; return; fi
     info "Current ports: [${PORTS}] (${FWD_PROTO})"
     ask_ports
@@ -1827,28 +2273,64 @@ change_ports() {
   fi
 
   if [[ $ROLE == iran ]]; then
-    info "Current ports: [${PORTS}] (${FWD_PROTO})"
+    info "Current ports: [${PORTS}] (${FWD_PROTO}), target on Kharej ${BH_TARGET}, Backhaul transport ${BH_TRANSPORT}"
     ask_ports
     ask_fwd_proto
+    ask_bh_target
     write_config
-    rh_write_config || return
-    systemctl restart "$RH_UNIT" && ok "Rathole restarted with the new port list."
-    warn "The port list is part of the token. Run this option (6) on the Kharej server and paste the new token below - both rathole sides need the same list."
+    bh_write_config || return
+    systemctl restart "$BH_UNIT" && ok "Backhaul restarted with the new port list."
+    warn "The port list lives in the Backhaul server on THIS (Iran) server - the Kharej client needs no update."
+    warn "To refresh the port list shown by the Kharej status, run this option (6) there and paste the token below."
     print_token
   else
-    info "Current ports (from the Iran token): [${PORTS}] (${FWD_PROTO}), target ${RH_TARGET}"
-    echo "Paste the updated token from the Iran server to sync the port list,"
-    echo "or press Enter to keep the ports and only change the target address."
+    info "Current ports (from the Iran token): [${PORTS}] (${FWD_PROTO}), target ${BH_TARGET}"
+    echo "The ports are opened by the Iran server; the Kharej Backhaul client needs no port list."
+    echo "Paste the updated token from the Iran server to refresh the displayed list, or press Enter to keep it."
     read -r -p "Token: " tok
     if [[ -n $tok ]]; then
       parse_token "$tok" || { err "Invalid token."; return; }
       [[ $T_MASTER == "$MASTER" ]] || { err "That token belongs to a different tunnel (key mismatch)."; return; }
-      PORTS=$(norm_ports "$T_PORTS"); FWD_PROTO=$T_PROTO
+      [[ $T_ENGINE == "$ENGINE" ]] || { err "That token was made for another engine (${T_ENGINE})."; return; }
+      PORTS=$(norm_ports "$T_PORTS"); FWD_PROTO=$T_PROTO; BH_TARGET=$T_BHTARGET
+      [[ $T_BHTR == "$BH_TRANSPORT" ]] || warn "The token carries another Backhaul transport (${T_BHTR}) - use menu 14 to switch it."
+      write_config
+      ok "Port list updated."
     fi
-    ask_rh_target
+  fi
+}
+
+# Change the Backhaul transport on an installed tunnel (Iran first, then Kharej). Same key, no re-install.
+change_bh_transport() {
+  local tok
+  load_config 2>/dev/null || { warn "Tunnel is not installed."; return; }
+  if [[ $ENGINE != backhaul ]]; then warn "This install does not use Backhaul (legacy DNAT engine) - re-install to switch."; return; fi
+
+  if [[ $ROLE == iran ]]; then
+    info "Current Backhaul transport: ${BH_TRANSPORT}"
+    ask_bh_transport
+    ask_fwd_proto                      # UDP over the tunnel exists for the tcp transport only
+    ensure_deps || return
     write_config
-    rh_write_config || return
-    systemctl restart "$RH_UNIT" && ok "Rathole client restarted."
+    load_config
+    bh_write_config || return
+    "$BIN" fw >/dev/null 2>&1          # the control-port rule depends on tcp / udp
+    if systemctl is-active --quiet "$APP"; then systemctl kill --signal=HUP --kill-who=main "$APP"; fi
+    systemctl restart "$BH_UNIT" && ok "Backhaul restarted with the transport ${BH_TRANSPORT}."
+    print_token
+    warn "Kharej server: run this option (14) and paste the token above. The reverse tunnel stays down until both sides use the same transport."
+  else
+    echo "Paste the NEW token shown by the Iran server after it changed the Backhaul transport (Iran: menu 14 or 8)."
+    read -r -p "Token: " tok
+    parse_token "$tok" || { err "Invalid token."; return; }
+    [[ $T_MASTER == "$MASTER" ]] || { err "That token belongs to a different tunnel (key mismatch)."; return; }
+    [[ $T_ENGINE == "$ENGINE" ]] || { err "That token was made for another engine (${T_ENGINE})."; return; }
+    BH_TRANSPORT=$T_BHTR; BH_TARGET=$T_BHTARGET; PORTS=$(norm_ports "$T_PORTS"); FWD_PROTO=$T_PROTO
+    write_config
+    load_config
+    bh_write_config || return
+    if systemctl is-active --quiet "$APP"; then systemctl kill --signal=HUP --kill-who=main "$APP"; fi
+    systemctl restart "$BH_UNIT" && ok "Backhaul client restarted with the transport ${BH_TRANSPORT}."
   fi
 }
 
@@ -1862,7 +2344,7 @@ change_transport() {
   if [[ $ROLE == iran ]]; then
     info "Current transport: $( [[ $MODE == udp ]] && echo "ESP-in-UDP, port $UDP_PORT" || echo "raw ESP (IP protocol 50)" )"
     ask_transport
-    if [[ $MODE == udp && $ENGINE == rathole ]] && ports_include "$PORTS" "$UDP_PORT"; then
+    if [[ $MODE == udp && $ENGINE == backhaul ]] && ports_include "$PORTS" "$UDP_PORT"; then
       err "UDP port $UDP_PORT is in the forwarded port list - choose another transport port (nothing was changed)."
       return
     fi
@@ -1882,7 +2364,9 @@ change_transport() {
     read -r -p "Token: " tok
     parse_token "$tok" || { err "Invalid token."; return; }
     [[ $T_MASTER == "$MASTER" ]] || { err "That token belongs to a different tunnel (key mismatch)."; return; }
+    [[ $T_ENGINE == "$ENGINE" ]] || { err "That token was made for another engine (${T_ENGINE})."; return; }
     MODE=$T_MODE; UDP_PORT=$T_UDP; PORTS=$(norm_ports "$T_PORTS"); FWD_PROTO=$T_PROTO
+    BH_TRANSPORT=$T_BHTR; BH_TARGET=$T_BHTARGET
     ensure_deps || return
     write_config
     load_config
@@ -1901,45 +2385,84 @@ show_token() {
 
 restart_tunnel() {
   load_config 2>/dev/null || { warn "Tunnel is not installed."; return; }
+  install_self 2>/dev/null                     # picks up a newer version of this script
+  write_unit
+  [[ $ENGINE == backhaul ]] && write_bh_unit
+  legacy_rathole_cleanup
+  systemctl daemon-reload
   systemctl restart "$APP" && ok "Tunnel restarted."
-  if [[ $ENGINE == rathole ]]; then
-    systemctl restart "$RH_UNIT" && ok "Rathole restarted."
+  if [[ $ENGINE == backhaul ]]; then
+    systemctl restart "$BH_UNIT" && ok "Backhaul restarted."
   fi
 }
 
-update_rathole() {
+update_backhaul() {
   load_config 2>/dev/null || { warn "Tunnel is not installed."; return; }
-  if [[ $ENGINE != rathole ]]; then warn "This install does not use rathole (legacy DNAT engine) - re-install to switch."; return; fi
+  if [[ $ENGINE != backhaul ]]; then warn "This install does not use Backhaul (legacy DNAT engine) - re-install to switch."; return; fi
   ensure_deps || return
-  ensure_rathole force || return
-  systemctl restart "$RH_UNIT" && ok "Rathole restarted with core v$(rh_version)."
+  ensure_backhaul force || return
+  systemctl restart "$BH_UNIT" && ok "Backhaul restarted with core v$(bh_version)."
 }
 
 change_watchdog() {
   load_config 2>/dev/null || { warn "Tunnel is not installed."; return; }
-  local h s
+  local h s m t b old_tune cur="$MTU"
+  [[ -r /sys/class/net/${IF_NAME}/mtu ]] && cur=$(<"/sys/class/net/${IF_NAME}/mtu")
   echo "Current: preventive rebuild $( (( FORCE_REBUILD_SEC > 0 )) && echo "every $((FORCE_REBUILD_SEC/3600))h" || echo disabled), rx-stall trigger ${RX_STALL_SEC}s"
+  echo "         MTU ${cur} ($( (( MTU_SET > 0 )) && echo fixed || echo automatic )), network tuning (BBR / buffers): $( [[ $NET_TUNE == 1 ]] && echo on || echo off )"
+  echo
   read -r -p "New preventive-rebuild interval in hours (0 = disable) [$((FORCE_REBUILD_SEC/3600))]: " h
   h=${h:-$((FORCE_REBUILD_SEC/3600))}
   [[ $h =~ ^[0-9]+$ ]] || { err "Invalid number."; return; }
   read -r -p "New rx-stall trigger in seconds, min 10 [$RX_STALL_SEC]: " s
   s=${s:-$RX_STALL_SEC}
   [[ $s =~ ^[0-9]+$ ]] && (( s >= 10 )) || { err "Invalid number (min 10)."; return; }
-  FORCE_REBUILD_SEC=$(( h * 3600 ))
-  RX_STALL_SEC=$s
+  echo "Tunnel MTU: 0 = automatic (from the WAN link), a number 576-1500, or m = measure the real path now"
+  echo "(ESP-in-UDP only, the other server must be up). Too high = stalls / slow transfers, too low = a little overhead."
+  read -r -p "MTU [${MTU_SET}]: " m
+  m=${m:-$MTU_SET}
+  if [[ $m == m || $m == M ]]; then
+    route_info "$PEER_PUB" >/dev/null 2>&1
+    info "Measuring the path MTU (up to ~15 s)..."
+    pmtu_scan
+    if (( PM_BEST > 0 )); then
+      b=$MTU_UDP
+      m=$PM_REC; (( m > b )) && m=$b
+      ok "Largest outer packet that passes: ${PM_BEST} bytes -> tunnel MTU ${m}"
+    else
+      warn "Could not measure (is the peer up and ESP-in-UDP in use?) - keeping the current MTU setting."
+      m=$MTU_SET
+    fi
+  fi
+  [[ $m =~ ^[0-9]+$ ]] && { (( m == 0 || (m >= 576 && m <= 1500) )); } || { err "Invalid MTU."; return; }
+  read -r -p "Network tuning (BBR, bigger buffers, MTU probing) on this server? [$( [[ $NET_TUNE == 1 ]] && echo Y/n || echo y/N )]: " t
+  case ${t:-} in [Yy]*) t=1 ;; [Nn]*) t=0 ;; *) t=$NET_TUNE ;; esac
+
+  old_tune=$NET_TUNE
+  FORCE_REBUILD_SEC=$(( h * 3600 )); RX_STALL_SEC=$s; MTU_SET=$m; NET_TUNE=$t
   write_config
-  if systemctl is-active --quiet "$APP"; then systemctl restart "$APP"; fi
-  ok "Updated: preventive rebuild $( (( h == 0 )) && echo disabled || echo "every ${h}h"), rx-stall trigger ${RX_STALL_SEC}s."
+  route_info "$PEER_PUB" >/dev/null 2>&1
+  if ip link show "$IF_NAME" >/dev/null 2>&1; then
+    calc_mtu
+    ip link set dev "$IF_NAME" mtu "$MTU" && ok "MTU is now ${MTU} (applied live)."
+  fi
+  if [[ $t == 0 && $old_tune == 1 ]]; then tune_restore; fi
+  sysctl_apply
+  if systemctl is-active --quiet "$APP"; then systemctl kill --signal=HUP --kill-who=main "$APP"; fi
+  ok "Saved and applied - no restart was needed, existing connections are untouched."
 }
 
 banner() {
   [[ -t 1 ]] && clear
   echo "${C_B}==============================================================${C_0}"
-  echo "${C_B}   ESP Tunnel Manager v${VERSION}  -  ESP + Rathole reverse tunnel${C_0}"
+  echo "${C_B}   ESP Tunnel Manager v${VERSION}  -  ESP + Backhaul reverse tunnel${C_0}"
   echo "${C_B}   Iran ${IP_IRAN}  <=======  ESP  =======>  Kharej ${IP_KHAREJ}${C_0}"
   echo "${C_B}==============================================================${C_0}"
   if load_config 2>/dev/null; then
-    echo " Installed role: $ROLE   |   engine: $ENGINE   |   service: $(systemctl is-active "$APP" 2>/dev/null)"
+    echo " Installed role: $ROLE   |   engine: $ENGINE$( [[ $ENGINE == backhaul ]] && echo " ($BH_TRANSPORT)" )   |   service: $(systemctl is-active "$APP" 2>/dev/null)"
+    if [[ $ENGINE == rathole ]]; then
+      warn "This install still uses the old Rathole engine, which is no longer part of this script - run option 5, then option 1 / 2 to switch to Backhaul."
+    fi
   else
     echo " Not installed yet."
   fi
@@ -1950,20 +2473,21 @@ menu() {
   local ch
   while true; do
     banner
-    echo "  1) Tunnel Set Iran Server  (rathole server)"
-    echo "  2) Tunnel Set Client (Kharej)  (rathole client)"
+    echo "  1) Tunnel Set Iran Server  (Backhaul server)"
+    echo "  2) Tunnel Set Client (Kharej)  (Backhaul client)"
     echo "  3) Status Tunnel"
     echo "  4) Live Log"
     echo "  5) Uninstall Full Tunnel"
     echo "  ------------------------------------"
-    echo "  6) Change forwarded ports (Iran) / sync ports + target (Kharej)"
+    echo "  6) Change forwarded ports + target (Iran) / sync ports (Kharej)"
     echo "  7) Restart tunnel"
     echo "  8) Show token (Iran)"
-    echo "  9) Watchdog / preventive-rebuild settings"
-    echo " 10) Update rathole core"
+    echo "  9) Watchdog / MTU / network tuning settings"
+    echo " 10) Update Backhaul core"
     echo " 11) Diagnose connection (why no ping?)"
     echo " 12) Change transport / UDP port (Iran first, then Kharej)"
     echo " 13) Sync system clock (keys depend on it)"
+    echo " 14) Change Backhaul transport (Iran first, then Kharej)"
     echo "  0) Exit"
     echo
     read -r -p "Select: " ch || exit 0
@@ -1978,10 +2502,11 @@ menu() {
       7) restart_tunnel; echo; pause ;;
       8) show_token; echo; pause ;;
       9) change_watchdog; echo; pause ;;
-      10) update_rathole; echo; pause ;;
+      10) update_backhaul; echo; pause ;;
       11) diagnose; echo; pause ;;
       12) change_transport; echo; pause ;;
       13) sync_clock; echo; pause ;;
+      14) change_bh_transport; echo; pause ;;
       0|q|Q) exit 0 ;;
       *) warn "Invalid choice."; sleep 1 ;;
     esac
@@ -1989,7 +2514,7 @@ menu() {
 }
 
 usage() {
-  echo "Usage: $0 [menu|status|diag|daemon|teardown|fw|rh-run]"
+  echo "Usage: $0 [menu|status|diag|daemon|teardown|fw|bh-run]"
 }
 
 main() {
@@ -1998,7 +2523,8 @@ main() {
     status)   need_root; cmd_status ;;
     diag)     need_root; diagnose ;;
     daemon)   need_root; cmd_daemon ;;
-    rh-run)   need_root; cmd_rh_run ;;
+    bh-run)   need_root; cmd_bh_run ;;
+    rh-run)   need_root; log "the old Rathole engine was replaced by Backhaul - disabling the old unit (re-install: menu 5, then 1 / 2)"; legacy_rathole_cleanup ;;
     teardown) need_root; cmd_teardown ;;
     fw)       need_root; cmd_fw ;;
     *)        usage; exit 1 ;;
