@@ -19,6 +19,20 @@
 #     The Backhaul transport is chosen during the install on the Iran server:
 #     tcp / tcpmux / udp / ws / wss / wsmux / wssmux (it travels inside the token).
 #
+#  v2.6 - IPv4 AND IPv6 on both servers, two-way port forwarding
+#   * Both servers now ask for the addresses of BOTH servers in IPv4 and IPv6 (Iran: all four; Kharej: the
+#     Iran server's IPv4 + IPv6 - the Kharej addresses come from the token). Any combination is fine, but at
+#     least one IP version needs an address on both servers. When both versions are complete you pick the
+#     primary one, and the tunnel can fail over between them automatically: if the link stays dead, BOTH
+#     servers alternate IPv4 <-> IPv6 in time slots aligned to the UTC clock until the link works again.
+#   * Port forwarding is two-way: the Iran server opens ports that are delivered to the Kharej server
+#     (as before) AND, optionally, the Kharej server opens ports that are delivered to the Iran server.
+#     The second direction is a second Backhaul instance with the roles swapped (Kharej = server on
+#     10.10.10.1:8091, Iran = client). Same transport, same key; the targets may be 127.0.0.1 or the
+#     tunnel addresses 10.10.10.1 / 10.10.10.2.
+#   * Token format v4 (carries all addresses + both port lists); v1 - v3 tokens are still accepted.
+#   * Menu 15 changes the addresses / primary IP version; menu 6 changes the ports of both directions.
+#
 #  v2.5 - IPv6 between the servers + the Kharej side asks for the Iran server IP
 #   * The connection between the two servers (the outer ESP / ESP-in-UDP packets) can now run over
 #     IPv4 OR IPv6. The Iran install asks which one; the Kharej side follows the token. Both
@@ -91,7 +105,7 @@
 # ==============================================================================
 
 APP="esp-tunnel"
-VERSION="2.5"
+VERSION="2.6"
 BIN="/usr/local/bin/${APP}"
 CONF_DIR="/etc/${APP}"
 CONF="${CONF_DIR}/config"
@@ -99,6 +113,7 @@ UNIT_FILE="/etc/systemd/system/${APP}.service"
 SYSCTL_FILE="/etc/sysctl.d/99-${APP}.conf"
 RUN_DIR="/run/${APP}"
 REG="${RUN_DIR}/sa.list"
+FAM_FILE="${RUN_DIR}/fam"                # IP version (4/6) the tunnel is using right now
 UDP_PID_FILE="${RUN_DIR}/udp.pid"
 TUNE_ORIG="${CONF_DIR}/sysctl.orig"     # sysctl values of this server before the tuning
 
@@ -110,9 +125,13 @@ BH_CRT="${CONF_DIR}/backhaul.crt"         # self-signed certificate for wss / ws
 BH_KEY="${CONF_DIR}/backhaul.key"
 BH_UNIT="${APP}-backhaul"
 BH_UNIT_FILE="/etc/systemd/system/${BH_UNIT}.service"
+BH_CONF_REV="${CONF_DIR}/backhaul-rev.toml"      # reverse direction: Kharej = server, Iran = client
+BH_UNIT_REV="${APP}-backhaul-rev"
+BH_UNIT_FILE_REV="/etc/systemd/system/${BH_UNIT_REV}.service"
 BH_REPO="Musixal/Backhaul"
 BH_FALLBACK_TAG="v0.7.2"          # used when the latest tag cannot be resolved
-DEFAULT_BH_PORT=8090              # control port, bound on the tunnel address only
+DEFAULT_BH_PORT=8090              # control port Iran -> Kharej direction, bound on the tunnel address only
+DEFAULT_BH_PORT_REV=8091          # control port of the Kharej -> Iran direction
 DEFAULT_BH_TRANSPORT="tcp"
 BH_HB_INTERVAL=15                 # server heartbeat (s)
 MAX_FWD_PORTS=1000                # Backhaul opens one listener per forwarded port
@@ -129,21 +148,28 @@ MTU_UDP=1380
 DEFAULT_UDP_PORT=4500
 DEFAULT_FORCE_REBUILD_SEC=43200   # 12h - unconditional preventive rebuild, 0 = disabled
 DEFAULT_RX_STALL_SEC=45           # seconds of "tx moving, rx frozen" before an early rebuild
+HUNT_SLOT=180                     # IPv4 <-> IPv6 fail-over: length of one UTC-aligned time slot (s)
+HUNT_GRACE=240                    # ... and how long a never-answered tunnel waits before the hunt starts (s)
 
 # ---- runtime state (filled by load_config) -----------------------------------
 ROLE=""; MASTER=""; IRAN_IP=""; KHAREJ_IP=""; MODE="esp"; UDP_PORT="$DEFAULT_UDP_PORT"
-PORTS=""; FWD_PROTO="both"
+IRAN_IP6=""; KHAREJ_IP6=""          # IPv4 in IRAN_IP / KHAREJ_IP, IPv6 in IRAN_IP6 / KHAREJ_IP6 (each may be empty)
+PRI_FAM=4; FAILOVER=1; HAVE4=0; HAVE6=0; ALT=0   # primary IP version, fail-over on/off, which versions are complete
+PORTS=""; FWD_PROTO="both"; PORTS_REV=""; FWD_PROTO_REV="both"
 LOCAL_INNER=""; PEER_INNER=""; PEER_PUB=""; OUT_LABEL=""; IN_LABEL=""; MTU="$MTU_ESP"
 LOCAL_ADDR=""; WAN_DEV=""; CUR_EPOCH=0
 FORCE_REBUILD_SEC="$DEFAULT_FORCE_REBUILD_SEC"; RX_STALL_SEC="$DEFAULT_RX_STALL_SEC"
 ENGINE=""; BH_PORT="$DEFAULT_BH_PORT"; BH_TARGET="127.0.0.1"; BH_AUTH=""; BH_TRANSPORT="$DEFAULT_BH_TRANSPORT"
+BH_PORT_REV="$DEFAULT_BH_PORT_REV"; BH_TARGET_REV="127.0.0.1"; BH_AUTH_REV=""
+# the Backhaul direction being handled (set by bh_dir): fwd = Iran opens ports -> Kharej, rev = Kharej opens ports -> Iran
+D_NAME=""; D_CIP=""; D_CPORT=""; D_PORTS=""; D_PROTO=""; D_TARGET=""; D_CONF=""; D_UNIT=""; D_UNIT_FILE=""; D_ARG=""; D_AUTH=""; D_SERVER=0
 MTU_SET=0; NET_TUNE=1            # MTU_SET 0 = automatic;  NET_TUNE 1 = BBR / buffer tuning on
 FAM=4                            # IP version of the outer (server <-> server) packets: 4 or 6
 
 # ---- daemon watchdog state (globals; meaningful only while cmd_daemon runs) --
 RX0=0; TX0=0; RX_STALL_START=0; LAST_REBUILD=0; FAILS=0; PEER_STATE="unknown"; XPREV=""
 REB_N=0; BACKOFF_UNTIL=0; UP_SINCE=0; EVER_UP=0; CNT_RX=0; CNT_TX=0
-PREV_BYTES=0; PING_RX0=0; BASE_POL=0; BASE_SA=0; PM_BEST=0; PM_REC=0
+PREV_BYTES=0; PING_RX0=0; BASE_POL=0; BASE_SA=0; PM_BEST=0; PM_REC=0; HUNT=0; START_TS=0
 
 # UDP socket that lets the kernel decapsulate ESP-in-UDP. The kernel hands packets that start
 # with four zero bytes (the "non-ESP marker") to user space: those are used as clear-text probes.
@@ -370,6 +396,42 @@ norm_addr()  { if [[ $1 == *:* ]]; then ip6_canon "$1"; else echo "$1"; fi; }
 addr_fam()   { if [[ $1 == *:* ]]; then echo 6; else echo 4; fi; }
 hp()         { if [[ $1 == *:* ]]; then echo "[$1]:$2"; else echo "$1:$2"; fi; }   # host:port text
 
+# which IP versions have an address on BOTH servers (HAVE4 / HAVE6), and whether both do (ALT)
+calc_have() {
+  HAVE4=0; HAVE6=0; ALT=0
+  [[ -n $IRAN_IP && -n $KHAREJ_IP ]]   && HAVE4=1
+  [[ -n $IRAN_IP6 && -n $KHAREJ_IP6 ]] && HAVE6=1
+  (( HAVE4 && HAVE6 )) && ALT=1
+  return 0
+}
+
+# apply_family <4|6>: IP version of the outer packets -> FAM + the peer address to use (needs ROLE)
+apply_family() {
+  FAM=$1
+  case $ROLE in
+    iran)   if [[ $FAM == 6 ]]; then PEER_PUB=$KHAREJ_IP6; else PEER_PUB=$KHAREJ_IP; fi ;;
+    kharej) if [[ $FAM == 6 ]]; then PEER_PUB=$IRAN_IP6;   else PEER_PUB=$IRAN_IP;   fi ;;
+  esac
+  return 0
+}
+
+# ask_addr_opt "<prompt>" "<default>" <4|6>  -> canonical address, or "" for "none" (Enter on an empty default, "-" or "none")
+ask_addr_opt() {
+  local a
+  while true; do
+    read -r -p "$1" a
+    a=${a:-$2}
+    case ${a,,} in ""|-|none) echo ""; return 0 ;; esac
+    if valid_addr "$a"; then
+      a=$(norm_addr "$a")
+      if [[ $(addr_fam "$a") == "$3" ]]; then echo "$a"; return 0; fi
+      err "This is an IPv$(addr_fam "$a") address - an IPv${3} address (or '-' for none) is needed."
+      continue
+    fi
+    err "Invalid address - enter a valid IPv${3} address, or '-' for none."
+  done
+}
+
 # ask_addr "<prompt>" "<default>" [4|6]  -> prints the canonical address (loops until valid; family optional)
 ask_addr() {
   local a
@@ -478,8 +540,11 @@ detect_public_ip() {   # detect_public_ip [4|6]
 #  Config
 # ------------------------------------------------------------------------------
 load_config() {
+  local f
   [[ -r $CONF ]] || return 1
   ENGINE=""; BH_PORT=""; BH_TARGET=""; BH_TRANSPORT=""; MTU_SET=""; NET_TUNE=""
+  IRAN_IP6=""; KHAREJ_IP6=""; PRI_FAM=""; FAILOVER=""
+  PORTS_REV=""; FWD_PROTO_REV=""; BH_TARGET_REV=""; BH_PORT_REV=""
   # shellcheck disable=SC1090
   source "$CONF"
   MODE=${MODE:-esp}; UDP_PORT=${UDP_PORT:-$DEFAULT_UDP_PORT}; FWD_PROTO=${FWD_PROTO:-both}
@@ -487,16 +552,35 @@ load_config() {
   RX_STALL_SEC=${RX_STALL_SEC:-$DEFAULT_RX_STALL_SEC}
   # configs written by esp-tunnel 1.x have no engine: they keep the iptables DNAT behaviour
   ENGINE=${ENGINE:-dnat}; BH_PORT=${BH_PORT:-$DEFAULT_BH_PORT}; BH_TARGET=${BH_TARGET:-127.0.0.1}
+  BH_PORT_REV=${BH_PORT_REV:-$DEFAULT_BH_PORT_REV}; BH_TARGET_REV=${BH_TARGET_REV:-127.0.0.1}; FWD_PROTO_REV=${FWD_PROTO_REV:-both}
   valid_bh_transport "${BH_TRANSPORT:-}" || BH_TRANSPORT=$DEFAULT_BH_TRANSPORT
   MTU_SET=${MTU_SET:-0}; NET_TUNE=${NET_TUNE:-1}
+  # configs of v2.5 kept ONE address per server (IPv4 or IPv6) in IRAN_IP / KHAREJ_IP
+  if [[ $IRAN_IP == *:* ]];   then IRAN_IP6=${IRAN_IP6:-$IRAN_IP};       IRAN_IP=""; fi
+  if [[ $KHAREJ_IP == *:* ]]; then KHAREJ_IP6=${KHAREJ_IP6:-$KHAREJ_IP}; KHAREJ_IP=""; fi
+  calc_have
+  (( HAVE4 || HAVE6 )) || return 1
+  case ${PRI_FAM:-} in
+    4) (( HAVE4 )) || PRI_FAM=6 ;;
+    6) (( HAVE6 )) || PRI_FAM=4 ;;
+    *) if (( HAVE4 )); then PRI_FAM=4; else PRI_FAM=6; fi ;;
+  esac
+  [[ ${FAILOVER:-1} == 0 ]] && FAILOVER=0 || FAILOVER=1
+  FAM=$PRI_FAM
+  # fail-over may have moved the tunnel to the other IP version: the daemon records what it is using
+  if (( ALT && FAILOVER )) && [[ -r $FAM_FILE ]]; then
+    f=$(<"$FAM_FILE")
+    if [[ $f == 4 && $HAVE4 == 1 ]] || [[ $f == 6 && $HAVE6 == 1 ]]; then FAM=$f; fi
+  fi
   case $ROLE in
-    iran)   LOCAL_INNER=$IP_IRAN;   PEER_INNER=$IP_KHAREJ; PEER_PUB=$KHAREJ_IP; OUT_LABEL=i2k; IN_LABEL=k2i ;;
-    kharej) LOCAL_INNER=$IP_KHAREJ; PEER_INNER=$IP_IRAN;   PEER_PUB=$IRAN_IP;   OUT_LABEL=k2i; IN_LABEL=i2k ;;
+    iran)   LOCAL_INNER=$IP_IRAN;   PEER_INNER=$IP_KHAREJ; OUT_LABEL=i2k; IN_LABEL=k2i ;;
+    kharej) LOCAL_INNER=$IP_KHAREJ; PEER_INNER=$IP_IRAN;   OUT_LABEL=k2i; IN_LABEL=i2k ;;
     *) return 1 ;;
   esac
+  apply_family "$FAM"
   [[ -n $MASTER && -n $PEER_PUB ]] || return 1
-  FAM=$(addr_fam "$PEER_PUB")
   BH_AUTH=$(kdf "${MASTER}|backhaul|auth" | cut -c1-40)
+  BH_AUTH_REV=$(kdf "${MASTER}|backhaul|auth|rev" | cut -c1-40)
   if [[ $MODE == udp ]]; then MTU=$MTU_UDP; else MTU=$MTU_ESP; fi
   return 0
 }
@@ -511,15 +595,23 @@ write_config() {
       printf 'MASTER=%q\n'    "$MASTER"
       printf 'IRAN_IP=%q\n'   "$IRAN_IP"
       printf 'KHAREJ_IP=%q\n' "$KHAREJ_IP"
+      printf 'IRAN_IP6=%q\n'   "$IRAN_IP6"
+      printf 'KHAREJ_IP6=%q\n' "$KHAREJ_IP6"
+      printf 'PRI_FAM=%q\n'    "$PRI_FAM"
+      printf 'FAILOVER=%q\n'   "$FAILOVER"
       printf 'MODE=%q\n'      "$MODE"
       printf 'UDP_PORT=%q\n'  "$UDP_PORT"
       printf 'PORTS=%q\n'     "$PORTS"
       printf 'FWD_PROTO=%q\n' "$FWD_PROTO"
+      printf 'PORTS_REV=%q\n'     "$PORTS_REV"
+      printf 'FWD_PROTO_REV=%q\n' "$FWD_PROTO_REV"
       printf 'FORCE_REBUILD_SEC=%q\n' "$FORCE_REBUILD_SEC"
       printf 'RX_STALL_SEC=%q\n'      "$RX_STALL_SEC"
       printf 'ENGINE=%q\n'    "$ENGINE"
       printf 'BH_PORT=%q\n'   "$BH_PORT"
       printf 'BH_TARGET=%q\n' "$BH_TARGET"
+      printf 'BH_PORT_REV=%q\n'   "$BH_PORT_REV"
+      printf 'BH_TARGET_REV=%q\n' "$BH_TARGET_REV"
       printf 'BH_TRANSPORT=%q\n' "$BH_TRANSPORT"
       printf 'MTU_SET=%q\n'  "$MTU_SET"
       printf 'NET_TUNE=%q\n' "$NET_TUNE"
@@ -528,18 +620,20 @@ write_config() {
   chmod 600 "$CONF"
 }
 
-# token v3 = base64( v3|master|iran_ip|kharej_ip|mode|udp_port|ports|proto|engine|bh_port|bh_transport|bh_target|checksum )
-# (v1 tokens and v2 tokens of the "dnat" engine are still accepted; v2 tokens of the old Rathole engine are not)
+# token v4 = base64( v4|master|iran_ip4|kharej_ip4|iran_ip6|kharej_ip6|primary|failover|mode|udp_port|ports|proto|engine|
+#                     bh_port|bh_transport|bh_target|ports_rev|proto_rev|target_rev|bh_port_rev|checksum )
+# (v1 / v3 tokens and v2 tokens of the "dnat" engine are still accepted; v2 tokens of the old Rathole engine are not)
 make_token() {
   local payload chk
-  payload="v3|${MASTER}|${IRAN_IP}|${KHAREJ_IP}|${MODE}|${UDP_PORT}|${PORTS}|${FWD_PROTO}|${ENGINE}|${BH_PORT}|${BH_TRANSPORT}|${BH_TARGET}"
+  payload="v4|${MASTER}|${IRAN_IP}|${KHAREJ_IP}|${IRAN_IP6}|${KHAREJ_IP6}|${PRI_FAM}|${FAILOVER}|${MODE}|${UDP_PORT}|${PORTS}|${FWD_PROTO}|${ENGINE}|${BH_PORT}|${BH_TRANSPORT}|${BH_TARGET}|${PORTS_REV}|${FWD_PROTO_REV}|${BH_TARGET_REV}|${BH_PORT_REV}"
   chk=$(printf '%s' "$payload" | sha256sum | cut -c1-6)
   printf '%s|%s' "$payload" "$chk" | base64 -w0
 }
 
-T_MASTER=""; T_IRAN=""; T_KHAREJ=""; T_MODE=""; T_UDP=""; T_PORTS=""; T_PROTO=""; T_ENGINE=""; T_BHPORT=""; T_BHTR=""; T_BHTARGET=""
+T_MASTER=""; T_IRAN4=""; T_KHAREJ4=""; T_IRAN6=""; T_KHAREJ6=""; T_PRI=4; T_FAILOVER=1; T_MODE=""; T_UDP=""; T_PORTS=""; T_PROTO=""; T_ENGINE=""
+T_BHPORT=""; T_BHTR=""; T_BHTARGET=""; T_PORTS_REV=""; T_PROTO_REV="both"; T_TARGET_REV="127.0.0.1"; T_BHPORT_REV=""
 parse_token() {
-  local t dec n chk want payload
+  local t dec n chk want payload a
   local -a F=()
   t=$(tr -d '[:space:]' <<<"$1")
   [[ -n $t ]] || return 1
@@ -550,22 +644,41 @@ parse_token() {
     v1) (( n == 9 ))  || return 1 ;;
     v2) (( n == 11 )) || return 1 ;;
     v3) (( n == 13 )) || return 1 ;;
+    v4) (( n == 21 )) || return 1 ;;
     *)  return 1 ;;
   esac
   chk=${F[n-1]}
   payload=$(IFS='|'; printf '%s' "${F[*]:0:n-1}")
   want=$(printf '%s' "$payload" | sha256sum | cut -c1-6)
   [[ $chk == "$want" ]] || return 1
-  T_MASTER=${F[1]}; T_IRAN=${F[2]}; T_KHAREJ=${F[3]}; T_MODE=${F[4]}; T_UDP=${F[5]}; T_PORTS=${F[6]}; T_PROTO=${F[7]}
-  case ${F[0]} in
-    v3) T_ENGINE=${F[8]}; T_BHPORT=${F[9]}; T_BHTR=${F[10]}; T_BHTARGET=${F[11]} ;;
-    v2) T_ENGINE=${F[8]}; T_BHPORT=${F[9]}; T_BHTR=$DEFAULT_BH_TRANSPORT; T_BHTARGET=127.0.0.1 ;;
-    *)  T_ENGINE=dnat;    T_BHPORT=$DEFAULT_BH_PORT; T_BHTR=$DEFAULT_BH_TRANSPORT; T_BHTARGET=127.0.0.1 ;;
-  esac
+  T_MASTER=${F[1]}
+  T_IRAN4=""; T_KHAREJ4=""; T_IRAN6=""; T_KHAREJ6=""; T_FAILOVER=1
+  T_PORTS_REV=""; T_PROTO_REV=both; T_TARGET_REV=127.0.0.1; T_BHPORT_REV=$DEFAULT_BH_PORT_REV
+  if [[ ${F[0]} == v4 ]]; then
+    T_IRAN4=${F[2]}; T_KHAREJ4=${F[3]}; T_IRAN6=${F[4]}; T_KHAREJ6=${F[5]}; T_PRI=${F[6]}; T_FAILOVER=${F[7]}
+    T_MODE=${F[8]}; T_UDP=${F[9]}; T_PORTS=${F[10]}; T_PROTO=${F[11]}
+    T_ENGINE=${F[12]}; T_BHPORT=${F[13]}; T_BHTR=${F[14]}; T_BHTARGET=${F[15]}
+    T_PORTS_REV=${F[16]}; T_PROTO_REV=${F[17]}; T_TARGET_REV=${F[18]}; T_BHPORT_REV=${F[19]}
+  else
+    # v1 - v3: ONE address per server, IPv4 or IPv6
+    if [[ ${F[2]} == *:* ]]; then T_IRAN6=${F[2]}; T_KHAREJ6=${F[3]}; T_PRI=6; else T_IRAN4=${F[2]}; T_KHAREJ4=${F[3]}; T_PRI=4; fi
+    T_MODE=${F[4]}; T_UDP=${F[5]}; T_PORTS=${F[6]}; T_PROTO=${F[7]}
+    case ${F[0]} in
+      v3) T_ENGINE=${F[8]}; T_BHPORT=${F[9]}; T_BHTR=${F[10]}; T_BHTARGET=${F[11]} ;;
+      v2) T_ENGINE=${F[8]}; T_BHPORT=${F[9]}; T_BHTR=$DEFAULT_BH_TRANSPORT; T_BHTARGET=127.0.0.1 ;;
+      *)  T_ENGINE=dnat;    T_BHPORT=$DEFAULT_BH_PORT; T_BHTR=$DEFAULT_BH_TRANSPORT; T_BHTARGET=127.0.0.1 ;;
+    esac
+  fi
   [[ $T_MASTER =~ ^[0-9a-f]{64}$ ]] || return 1
-  valid_addr "$T_IRAN" && valid_addr "$T_KHAREJ" || return 1
-  [[ $(addr_fam "$T_IRAN") == "$(addr_fam "$T_KHAREJ")" ]] || return 1      # one tunnel = one IP version
-  T_IRAN=$(norm_addr "$T_IRAN"); T_KHAREJ=$(norm_addr "$T_KHAREJ")
+  for a in "$T_IRAN4" "$T_KHAREJ4"; do [[ -z $a ]] || valid_ip "$a" || return 1; done
+  for a in "$T_IRAN6" "$T_KHAREJ6"; do [[ -z $a ]] || valid_ip6 "$a" || return 1; done
+  [[ -z $T_IRAN6 ]]   || T_IRAN6=$(ip6_canon "$T_IRAN6")
+  [[ -z $T_KHAREJ6 ]] || T_KHAREJ6=$(ip6_canon "$T_KHAREJ6")
+  # at least one IP version must have an address on both servers
+  [[ ( -n $T_IRAN4 && -n $T_KHAREJ4 ) || ( -n $T_IRAN6 && -n $T_KHAREJ6 ) ]] || return 1
+  [[ $T_PRI == 4 || $T_PRI == 6 ]] || return 1
+  if [[ $T_PRI == 4 ]]; then [[ -n $T_IRAN4 && -n $T_KHAREJ4 ]] || T_PRI=6; else [[ -n $T_IRAN6 && -n $T_KHAREJ6 ]] || T_PRI=4; fi
+  [[ $T_FAILOVER == 0 || $T_FAILOVER == 1 ]] || return 1
   [[ $T_MODE == esp || $T_MODE == udp ]] || return 1
   valid_port "$T_UDP" || return 1
   [[ $T_PROTO == tcp || $T_PROTO == udp || $T_PROTO == both ]] || return 1
@@ -574,6 +687,10 @@ parse_token() {
   valid_bh_transport "$T_BHTR" || return 1
   valid_ip "$T_BHTARGET" || return 1
   norm_ports "$T_PORTS" >/dev/null || return 1
+  [[ -z $T_PORTS_REV ]] || norm_ports "$T_PORTS_REV" >/dev/null || return 1
+  [[ $T_PROTO_REV == tcp || $T_PROTO_REV == udp || $T_PROTO_REV == both ]] || return 1
+  valid_ip "$T_TARGET_REV" || return 1
+  valid_port "$T_BHPORT_REV" || return 1
   return 0
 }
 
@@ -588,7 +705,7 @@ ensure_deps() {
     have "$c" || missing+=("$c")
   done
   if [[ $MODE == udp ]] && ! have python3; then missing+=(python3); fi
-  if [[ $FAM == 6 ]] && ! have ip6tables; then missing+=(ip6tables); fi
+  if (( HAVE6 )) && ! have ip6tables; then missing+=(ip6tables); fi
   if [[ $ENGINE == backhaul ]]; then
     for c in tar gzip curl; do have "$c" || missing+=("$c"); done
     # the self-signed certificate of wss / wssmux is created on the Iran server only
@@ -671,6 +788,25 @@ check_kernel() {
   return 0
 }
 
+# run the kernel self-test for every IP version that has an address pair. When one of two versions
+# does not work on this server it can be dropped (the tunnel then runs on the other one only).
+check_kernel_all() {
+  local save=$FAM ok4=1 ok6=1 keep
+  if (( HAVE4 )); then FAM=4; check_kernel || ok4=0; fi
+  if (( HAVE6 )); then FAM=6; check_kernel || ok6=0; fi
+  FAM=$save
+  (( ok4 && ok6 )) && return 0
+  if (( ALT && ( ok4 || ok6 ) )); then
+    if (( ok4 )); then keep=4; else keep=6; fi
+    warn "IPv$(( 10 - keep )) does not work on this server (see above)."
+    confirm "Continue with IPv${keep} only (no fail-over)?" y || return 1
+    if (( keep == 4 )); then IRAN_IP6=""; KHAREJ_IP6=""; else IRAN_IP=""; KHAREJ_IP=""; fi
+    PRI_FAM=$keep; FAILOVER=0; calc_have; apply_family "$keep"
+    return 0
+  fi
+  return 1
+}
+
 clock_status() {
   local ntp=""
   have timedatectl && ntp=$(timedatectl show -p NTPSynchronized --value 2>/dev/null)
@@ -697,7 +833,7 @@ preflight_check() {
     echo "$lst" >&2
     bad=1
   fi
-  if [[ $FAM == 6 ]]; then
+  if (( HAVE6 )); then
     if [[ $(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null) == 1 ]]; then
       err "IPv6 is disabled on this server (net.ipv6.conf.all.disable_ipv6 = 1) - enable it or use IPv4."
       bad=1
@@ -792,10 +928,14 @@ fw_apply() {
   else
     ipt -A ESPT_IN -p 50 -s "$PEER_PUB" -j ACCEPT
   fi
-  if [[ $ROLE == iran && $ENGINE == backhaul ]]; then
-    # the Backhaul control port lives on the tunnel address only - never answer it from the WAN side
+  if [[ $ENGINE == backhaul ]]; then
+    # the Backhaul control ports live on the tunnel addresses only - never answer them from the WAN side
     [[ $BH_TRANSPORT == udp ]] && bp=udp
-    ipt -I ESPT_IN 1 -i "$WAN_DEV" -p "$bp" -d "$IP_IRAN" --dport "$BH_PORT" -j DROP
+    if [[ $ROLE == iran ]]; then
+      ipt -I ESPT_IN 1 -i "$WAN_DEV" -p "$bp" -d "$IP_IRAN" --dport "$BH_PORT" -j DROP
+    elif [[ -n $PORTS_REV ]]; then
+      ipt -I ESPT_IN 1 -i "$WAN_DEV" -p "$bp" -d "$IP_KHAREJ" --dport "$BH_PORT_REV" -j DROP
+    fi
   fi
 
   fw_chain_reset filter ESPT_FWD FORWARD
@@ -1117,6 +1257,7 @@ setup_all() {
   mkdir -p "$RUN_DIR"; : > "$REG"
   load_modules
   route_info "$PEER_PUB" || { log "ERROR: no route to peer $PEER_PUB"; return 1; }
+  echo "$FAM" > "$FAM_FILE" 2>/dev/null
   iface_setup            || return 1
   policies_setup         || return 1
   CUR_EPOCH=$(( $(date +%s) / EPOCH_LEN ))
@@ -1124,7 +1265,7 @@ setup_all() {
   if [[ $MODE == udp ]]; then udp_helper_ensure || return 1; fi
   sysctl_apply
   fw_apply
-  log "tunnel up: role=$ROLE ${LOCAL_INNER} <-> ${PEER_INNER}  transport=$MODE  engine=$ENGINE  local=$LOCAL_ADDR($WAN_DEV) peer=$PEER_PUB mtu=$MTU epoch=$CUR_EPOCH"
+  log "tunnel up: role=$ROLE ${LOCAL_INNER} <-> ${PEER_INNER}  transport=$MODE  ip=IPv${FAM}  engine=$ENGINE  local=$LOCAL_ADDR($WAN_DEV) peer=$PEER_PUB mtu=$MTU epoch=$CUR_EPOCH"
   return 0
 }
 
@@ -1227,13 +1368,38 @@ ensure_backhaul() {
   return 0
 }
 
+# Backhaul runs in up to two directions (two instances, roles swapped):
+#   fwd = the Iran server opens ports and delivers them to the Kharej server  (control 10.10.10.2:BH_PORT)
+#   rev = the Kharej server opens ports and delivers them to the Iran server  (control 10.10.10.1:BH_PORT_REV)
+# bh_dir <fwd|rev> sets the D_* variables for one direction (D_SERVER=1 when THIS host is the server of it)
+bh_dir() {
+  if [[ ${1:-fwd} == rev ]]; then
+    D_NAME=rev; D_CIP=$IP_KHAREJ; D_CPORT=$BH_PORT_REV; D_PORTS=$PORTS_REV; D_PROTO=$FWD_PROTO_REV; D_TARGET=$BH_TARGET_REV
+    D_CONF=$BH_CONF_REV; D_UNIT=$BH_UNIT_REV; D_UNIT_FILE=$BH_UNIT_FILE_REV; D_ARG=" rev"; D_AUTH=$BH_AUTH_REV
+    if [[ $ROLE == kharej ]]; then D_SERVER=1; else D_SERVER=0; fi
+  else
+    D_NAME=fwd; D_CIP=$IP_IRAN; D_CPORT=$BH_PORT; D_PORTS=$PORTS; D_PROTO=$FWD_PROTO; D_TARGET=$BH_TARGET
+    D_CONF=$BH_CONF; D_UNIT=$BH_UNIT; D_UNIT_FILE=$BH_UNIT_FILE; D_ARG=""; D_AUTH=$BH_AUTH
+    if [[ $ROLE == iran ]]; then D_SERVER=1; else D_SERVER=0; fi
+  fi
+  return 0
+}
+
+# the directions that are in use: fwd always, rev only when a Kharej port list exists
+bh_dirs() {
+  [[ -n $PORTS ]] && echo fwd
+  [[ -n $PORTS_REV ]] && echo rev
+  return 0
+}
+
 # ports that are already listening on this server (Backhaul of THIS tunnel excluded)
 busy_ports() {   # busy_ports "<norm ports>" -> space separated list
-  local mp used p
-  mp=$(systemctl show -p MainPID --value "$BH_UNIT" 2>/dev/null); mp=${mp:-0}
-  used=$(ss -Hltunp 2>/dev/null | awk -v mp="$mp" '
-    mp != 0 && index($0, "pid=" mp ",") { next }
-    { n = split($5, a, ":"); print a[n] }' | sort -u)
+  local pids used p
+  pids=$(systemctl show -p MainPID --value "$BH_UNIT" "$BH_UNIT_REV" 2>/dev/null | tr '\n' ' ')
+  used=$(ss -Hltunp 2>/dev/null | awk -v pids="$pids" '
+    BEGIN { n = split(pids, a, " ") }
+    { for (i = 1; i <= n; i++) if (a[i] != 0 && index($0, "pid=" a[i] ",")) next
+      k = split($5, b, ":"); print b[k] }' | sort -u)
   for p in $(expand_ports "$1"); do
     grep -qx "$p" <<< "$used" && printf '%s ' "$p"
   done
@@ -1246,14 +1412,14 @@ busy_ports() {   # busy_ports "<norm ports>" -> space separated list
 bh_ports_toml() {
   local spec p i n
   local -a specs=() items=()
-  if [[ ${BH_TARGET:-127.0.0.1} == 127.0.0.1 ]]; then
-    IFS=',' read -ra specs <<< "$PORTS"
+  if [[ ${D_TARGET:-127.0.0.1} == 127.0.0.1 ]]; then
+    IFS=',' read -ra specs <<< "$D_PORTS"
     for spec in "${specs[@]}"; do
       [[ -n $spec ]] && items+=("\"${spec}\"")
     done
   else
-    for p in $(expand_ports "$PORTS"); do
-      items+=("\"${p}=${BH_TARGET}:${p}\"")
+    for p in $(expand_ports "$D_PORTS"); do
+      items+=("\"${p}=${D_TARGET}:${p}\"")
     done
   fi
   n=${#items[@]}
@@ -1278,29 +1444,30 @@ bh_tls_ensure() {
   mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR"
   (
     umask 077
-    openssl req -x509 -newkey rsa:2048 -nodes -keyout "$BH_KEY" -out "$BH_CRT" -days 3650 -subj "/CN=${IP_IRAN}" >/dev/null 2>&1
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout "$BH_KEY" -out "$BH_CRT" -days 3650 -subj "/CN=${LOCAL_INNER}" >/dev/null 2>&1
   ) || { log "ERROR: cannot create the TLS certificate"; rm -f "$BH_KEY" "$BH_CRT"; return 1; }
   chmod 600 "$BH_KEY" "$BH_CRT"
   log "created a self-signed TLS certificate for ${BH_TRANSPORT}: ${BH_CRT}"
   return 0
 }
 
-bh_write_config() {
-  [[ -n $BH_AUTH ]] || { log "ERROR: backhaul config needs the master key"; return 1; }
-  if [[ $ROLE == iran ]]; then
-    [[ -n $PORTS ]] || { log "ERROR: backhaul server config needs a port list"; return 1; }
+bh_write_config() {   # bh_write_config [fwd|rev]
+  bh_dir "${1:-fwd}"
+  [[ -n $D_AUTH ]] || { log "ERROR: backhaul config needs the master key"; return 1; }
+  if (( D_SERVER )); then
+    [[ -n $D_PORTS ]] || { log "ERROR: backhaul server config needs a port list"; return 1; }
     if [[ $BH_TRANSPORT == wss || $BH_TRANSPORT == wssmux ]]; then bh_tls_ensure || return 1; fi
   fi
   mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR"
   (
     umask 077
     {
-      echo "# generated by ${APP} - changes are overwritten"
-      if [[ $ROLE == iran ]]; then
+      echo "# generated by ${APP} (${D_NAME} direction) - changes are overwritten"
+      if (( D_SERVER )); then
         echo "[server]"
-        echo "bind_addr = \"${LOCAL_INNER}:${BH_PORT}\""
+        echo "bind_addr = \"${D_CIP}:${D_CPORT}\""
         echo "transport = \"${BH_TRANSPORT}\""
-        echo "token = \"${BH_AUTH}\""
+        echo "token = \"${D_AUTH}\""
         echo "heartbeat = ${BH_HB_INTERVAL}"
         echo "channel_size = 2048"
         if [[ $BH_TRANSPORT != udp ]]; then
@@ -1308,7 +1475,7 @@ bh_write_config() {
           echo "nodelay = true"
         fi
         # UDP inside the TCP tunnel exists for the plain tcp transport only
-        if [[ $BH_TRANSPORT == tcp && $FWD_PROTO != tcp ]]; then echo "accept_udp = true"; fi
+        if [[ $BH_TRANSPORT == tcp && $D_PROTO != tcp ]]; then echo "accept_udp = true"; fi
         if [[ $BH_TRANSPORT == *mux ]]; then
           echo "mux_con = 8"
           bh_mux_toml
@@ -1323,9 +1490,9 @@ bh_write_config() {
         bh_ports_toml
       else
         echo "[client]"
-        echo "remote_addr = \"${PEER_INNER}:${BH_PORT}\""
+        echo "remote_addr = \"${D_CIP}:${D_CPORT}\""
         echo "transport = \"${BH_TRANSPORT}\""
-        echo "token = \"${BH_AUTH}\""
+        echo "token = \"${D_AUTH}\""
         echo "connection_pool = 8"
         echo "aggressive_pool = false"
         if [[ $BH_TRANSPORT != udp ]]; then
@@ -1339,22 +1506,23 @@ bh_write_config() {
         echo "web_port = 0"
         echo "log_level = \"info\""
       fi
-    } > "${BH_CONF}.new"
+    } > "${D_CONF}.new"
   )
-  chmod 600 "${BH_CONF}.new" && mv -f "${BH_CONF}.new" "$BH_CONF"
+  chmod 600 "${D_CONF}.new" && mv -f "${D_CONF}.new" "$D_CONF"
 }
 
-write_bh_unit() {
-  cat > "$BH_UNIT_FILE" <<EOF
+write_bh_unit() {   # write_bh_unit [fwd|rev]
+  bh_dir "${1:-fwd}"
+  cat > "$D_UNIT_FILE" <<EOF
 [Unit]
-Description=Backhaul reverse tunnel over the ESP tunnel (${APP})
+Description=Backhaul reverse tunnel, ${D_NAME} direction, over the ESP tunnel (${APP})
 After=network-online.target ${APP}.service
 Requires=${APP}.service
 StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-ExecStart=${BIN} bh-run
+ExecStart=${BIN} bh-run${D_ARG}
 Restart=always
 RestartSec=3
 OOMScoreAdjust=-500
@@ -1377,57 +1545,75 @@ legacy_rathole_cleanup() {
 }
 
 # runs under systemd: wait for the tunnel address, then become backhaul
-cmd_bh_run() {
+cmd_bh_run() {   # cmd_bh_run [fwd|rev]
   local mode
   load_config || { log "ERROR: missing or invalid $CONF"; exit 1; }
+  bh_dir "${1:-fwd}"
   [[ $ENGINE == backhaul ]] || { log "ERROR: engine is '$ENGINE', not backhaul"; exit 1; }
   bh_works "$BH_BIN" || { log "ERROR: backhaul core missing at $BH_BIN (menu option 10)"; exit 1; }
-  [[ -s $BH_CONF ]] || bh_write_config || exit 1
+  [[ -s $D_CONF ]] || bh_write_config "$D_NAME" || exit 1
   for _ in $(seq 1 60); do
     ip -4 addr show dev "$IF_NAME" 2>/dev/null | grep -q "inet ${LOCAL_INNER}/" && break
     sleep 1
   done
-  if [[ $ROLE == iran ]]; then mode=server; else mode=client; fi
-  log "[backhaul] starting as ${ROLE} (${mode}), transport ${BH_TRANSPORT}, control ${IP_IRAN}:${BH_PORT}, core v$(bh_version)"
-  exec "$BH_BIN" -c "$BH_CONF"
+  if (( D_SERVER )); then mode=server; else mode=client; fi
+  log "[backhaul ${D_NAME}] starting as ${ROLE} (${mode}), transport ${BH_TRANSPORT}, control ${D_CIP}:${D_CPORT}, core v$(bh_version)"
+  exec "$BH_BIN" -c "$D_CONF"
 }
 
 start_backhaul() {
+  local d rc=0
   legacy_rathole_cleanup
   if [[ $ENGINE != backhaul ]]; then
-    systemctl disable --now "$BH_UNIT" >/dev/null 2>&1
-    rm -f "$BH_UNIT_FILE"
+    systemctl disable --now "$BH_UNIT" "$BH_UNIT_REV" >/dev/null 2>&1
+    rm -f "$BH_UNIT_FILE" "$BH_UNIT_FILE_REV"
     return 0
   fi
   bh_works "$BH_BIN" || { err "Backhaul core is missing - use menu option 10."; return 1; }
-  bh_write_config    || return 1
-  write_bh_unit
-  systemctl daemon-reload
-  systemctl enable "$BH_UNIT" >/dev/null 2>&1
-  systemctl restart "$BH_UNIT"
-  sleep 2
-  if systemctl is-active --quiet "$BH_UNIT"; then
-    ok "Backhaul reverse-tunnel service is running (transport: ${BH_TRANSPORT})."
-    return 0
+  # a direction without a port list does not run
+  if [[ -z $PORTS_REV ]]; then
+    systemctl disable --now "$BH_UNIT_REV" >/dev/null 2>&1
+    rm -f "$BH_UNIT_FILE_REV" "$BH_CONF_REV"
   fi
-  err "Backhaul service failed to start. Last log lines:"
-  journalctl -u "$BH_UNIT" -n 25 --no-pager
-  return 1
+  for d in $(bh_dirs); do
+    bh_write_config "$d" || return 1
+    write_bh_unit "$d"
+  done
+  systemctl daemon-reload
+  for d in $(bh_dirs); do
+    bh_dir "$d"
+    systemctl enable "$D_UNIT" >/dev/null 2>&1
+    systemctl restart "$D_UNIT"
+  done
+  sleep 2
+  for d in $(bh_dirs); do
+    bh_dir "$d"
+    if systemctl is-active --quiet "$D_UNIT"; then
+      ok "Backhaul ${D_NAME} direction is running ($( (( D_SERVER )) && echo server || echo client ), transport: ${BH_TRANSPORT})."
+    else
+      err "Backhaul ${D_NAME} direction failed to start. Last log lines:"
+      journalctl -u "$D_UNIT" -n 25 --no-pager
+      rc=1
+    fi
+  done
+  return $rc
 }
 
 # number of established TCP connections on the Backhaul control port (control + data channels).
 # The udp transport has no TCP sessions to count: "n/a"
-bh_conn_count() {
+bh_conn_count() {   # bh_conn_count [fwd|rev]
+  bh_dir "${1:-fwd}"
   if [[ $BH_TRANSPORT == udp ]]; then echo "n/a"; return 0; fi
-  ss -Htn state established 2>/dev/null | awk -v a="${IP_IRAN}:${BH_PORT}" \
+  ss -Htn state established 2>/dev/null | awk -v a="${D_CIP}:${D_CPORT}" \
     '{for(i=1;i<=NF;i++) if($i==a){c++; break}} END{print c+0}'
 }
 
 # "<ports listening>/<ports configured>" on the Iran server
-bh_listen_summary() {
+bh_listen_summary() {   # bh_listen_summary [fwd|rev]  -> "<listening>/<configured>"
   local used p n=0 t=0
+  bh_dir "${1:-fwd}"
   used=$(ss -Hltun 2>/dev/null | awk '{k=split($5,a,":"); print a[k]}' | sort -u)
-  for p in $(expand_ports "$PORTS"); do
+  for p in $(expand_ports "$D_PORTS"); do
     t=$((t + 1))
     grep -qx "$p" <<< "$used" && n=$((n + 1))
   done
@@ -1436,14 +1622,19 @@ bh_listen_summary() {
 
 # after an ESP rebuild the tunnel address is recreated - make sure the Backhaul server still listens on it
 bh_post_rebuild() {
-  local fl=-Hltn
-  [[ $ENGINE == backhaul && $ROLE == iran ]] || return 0
-  systemctl is-active --quiet "$BH_UNIT" 2>/dev/null || return 0
-  [[ $BH_TRANSPORT == udp ]] && fl=-Hlun
-  if ! ss "$fl" "sport = :${BH_PORT}" 2>/dev/null | grep -q "${LOCAL_INNER}:${BH_PORT}"; then
-    log "backhaul control listener missing after the rebuild - restarting backhaul"
-    systemctl restart --no-block "$BH_UNIT"
-  fi
+  local d fl
+  [[ $ENGINE == backhaul ]] || return 0
+  for d in $(bh_dirs); do
+    bh_dir "$d"
+    (( D_SERVER )) || continue
+    systemctl is-active --quiet "$D_UNIT" 2>/dev/null || continue
+    fl=-Hltn; [[ $BH_TRANSPORT == udp ]] && fl=-Hlun
+    if ! ss "$fl" "sport = :${D_CPORT}" 2>/dev/null | grep -q "${D_CIP}:${D_CPORT}"; then
+      log "backhaul ${D_NAME} control listener missing after the rebuild - restarting backhaul"
+      systemctl restart --no-block "$D_UNIT"
+    fi
+  done
+  return 0
 }
 
 # ------------------------------------------------------------------------------
@@ -1553,8 +1744,35 @@ wd_reload() {
   log "settings reloaded: rx-stall ${RX_STALL_SEC}s, preventive rebuild ${FORCE_REBUILD_SEC}s, mtu-set ${MTU_SET}, tuning ${NET_TUNE}, backhaul transport ${BH_TRANSPORT}"
 }
 
+# ---- IPv4 <-> IPv6 fail-over -------------------------------------------------------------
+# While the link is dead BOTH servers alternate between the two IP versions in time slots derived from the
+# UTC clock (primary version in even slots, the other one in odd slots). They compute the same value without
+# talking to each other, so they meet; once a ping works the hunt stops and the tunnel stays where it is.
+hunt_family() {   # hunt_family <now-epoch-seconds>
+  local slot=$(( $1 / HUNT_SLOT ))
+  if (( slot % 2 == 0 )); then echo "$PRI_FAM"; else echo $(( 10 - PRI_FAM )); fi
+}
+
+family_routable() {   # family_routable <4|6>: does this server have a route to the peer over that IP version?
+  local peer
+  if [[ $ROLE == iran ]]; then
+    if [[ $1 == 6 ]]; then peer=$KHAREJ_IP6; else peer=$KHAREJ_IP; fi
+  else
+    if [[ $1 == 6 ]]; then peer=$IRAN_IP6; else peer=$IRAN_IP; fi
+  fi
+  [[ -n $peer ]] || return 1
+  ip "-$1" route get "$peer" >/dev/null 2>&1
+}
+
+start_hunt() {   # start_hunt "<reason>"
+  (( ALT && FAILOVER && ! HUNT )) || return 0
+  HUNT=1
+  log "link problem (${1}) - IPv4/IPv6 fail-over started: both servers alternate every ${HUNT_SLOT}s (UTC aligned) until the link is up"
+  return 0
+}
+
 cmd_daemon() {
-  local tries=0 last_fix=0 last_xwarn=0 e now xcur tick=0 rate la wd chk n_pol n_sa
+  local tries=0 last_fix=0 last_xwarn=0 e now xcur tick=0 rate la wd chk n_pol n_sa want
   load_config || { log "ERROR: missing or invalid $CONF"; exit 1; }
   mkdir -p "$RUN_DIR"
   trap 'log "stop signal received"; exit 0' TERM INT
@@ -1562,15 +1780,21 @@ cmd_daemon() {
 
   until route_info "$PEER_PUB"; do
     (( ++tries > 30 )) && { log "ERROR: no route to $PEER_PUB after 60s"; exit 1; }
+    if (( ALT && FAILOVER && tries % 8 == 0 )); then       # no route in this IP version yet: try the other one
+      apply_family $(( 10 - FAM ))
+      log "no route to the peer yet - trying IPv${FAM} (${PEER_PUB})"
+    fi
     sleep 2
   done
   setup_all || { log "ERROR: setup failed"; exit 1; }
   xfrm_baseline
   printf -v LAST_REBUILD '%(%s)T' -1
+  START_TS=$LAST_REBUILD; HUNT=0
   read_counters; RX0=$CNT_RX; TX0=$CNT_TX; PREV_BYTES=$(( CNT_RX + CNT_TX ))
   XPREV=$(xfrm_nonzero_counters)
   EVER_UP=0
   log "watchdog active: rx-stall trigger ${RX_STALL_SEC}s, preventive rebuild $( (( FORCE_REBUILD_SEC > 0 )) && echo "every $((FORCE_REBUILD_SEC/3600))h" || echo disabled)"
+  log "outer connection: IPv${FAM} to ${PEER_PUB}; IPv4/IPv6 fail-over $( (( ALT && FAILOVER )) && echo "on (primary IPv${PRI_FAM})" || echo off)"
   log "waiting for the peer $PEER_INNER (the other side must be installed and its service running)"
 
   while true; do
@@ -1603,6 +1827,22 @@ cmd_daemon() {
     if ! ip link show "$IF_NAME" >/dev/null 2>&1; then
       watchdog_rebuild "interface $IF_NAME vanished"
       continue
+    fi
+
+    # --- IPv4 <-> IPv6 fail-over hunt (only when both IP versions are configured) ---
+    if (( ALT && FAILOVER && ! EVER_UP && ! HUNT && now - START_TS >= HUNT_GRACE )); then
+      start_hunt "no answer from the peer since the start"
+    fi
+    if (( HUNT )); then
+      want=$(hunt_family "$now")
+      if [[ $want != "$FAM" ]] && (( now - LAST_REBUILD >= 60 )); then
+        if family_routable "$want"; then
+          apply_family "$want"
+          watchdog_rebuild "IPv4/IPv6 fail-over: switching the connection to IPv${FAM} (${PEER_PUB})" skip-forensic
+          continue
+        fi
+        (( tick % 12 == 0 )) && log "fail-over: no route over IPv${want} on this server - staying on IPv${FAM}"
+      fi
     fi
 
     # --- every 30 s: self-healing checks (no need to wait for ping failures) ---
@@ -1658,6 +1898,7 @@ cmd_daemon() {
     if (( EVER_UP && CNT_TX > TX0 && CNT_RX == RX0 )); then
       (( RX_STALL_START == 0 )) && RX_STALL_START=$now
       if (( now - RX_STALL_START >= RX_STALL_SEC && now >= BACKOFF_UNTIL )); then
+        start_hunt "asymmetric blackout"
         watchdog_rebuild "asymmetric blackout: no inbound traffic for ${RX_STALL_SEC}s while outbound is active"
         continue
       fi
@@ -1669,6 +1910,7 @@ cmd_daemon() {
     if ping -c1 -W2 -I "$IF_NAME" "$PEER_INNER" >/dev/null 2>&1; then
       if [[ $PEER_STATE != up ]]; then log "peer $PEER_INNER reachable - tunnel UP"; fi
       PEER_STATE=up; FAILS=0; EVER_UP=1
+      if (( HUNT )); then HUNT=0; log "link is up over IPv${FAM} - fail-over hunt ended"; fi
       (( UP_SINCE == 0 )) && UP_SINCE=$now
       if (( now - UP_SINCE >= 120 )); then REB_N=0; BACKOFF_UNTIL=0; fi   # stable for 2 min: forget past failures
     else
@@ -1683,6 +1925,7 @@ cmd_daemon() {
           PING_RX0=$CNT_RX
         elif (( now - last_fix >= 180 && now >= BACKOFF_UNTIL )); then
           last_fix=$now
+          start_hunt "peer unreachable for 60s+"
           if (( EVER_UP || REB_N == 0 )); then
             watchdog_rebuild "peer unreachable (ping) for 60s+"
           else
@@ -1777,45 +2020,63 @@ confirm_reinstall() {
   return 0
 }
 
-ask_ports() {
-  local raw norm p spec cnt busy
+ask_ports() {   # ask_ports [rev]   rev = ports that the KHAREJ server opens (Kharej -> Iran direction)
+  local rev=${1:-} raw norm p spec cnt busy cur="" prompt
   local -a sp=()
+  if [[ $rev == rev ]]; then
+    cur=$PORTS_REV
+    echo
+    echo "Two-way forwarding (optional): ports opened on the KHAREJ server and delivered to the IRAN server."
+    prompt="Ports to open on the Kharej server (comma separated; Enter = $( [[ -n $cur ]] && echo "keep [${cur}]" || echo none ); - = none): "
+  else
+    prompt="Ports to open on the Iran server (comma separated, e.g. 1080,443,8000-8100): "
+  fi
   while true; do
-    read -r -p "Ports to open on the Iran server (comma separated, e.g. 1080,443,8000-8100): " raw
+    read -r -p "$prompt" raw
+    if [[ $rev == rev ]]; then
+      [[ -z $raw ]] && return 0                                  # keep the current list
+      if [[ $raw == - ]]; then PORTS_REV=""; return 0; fi
+    fi
     if ! norm=$(norm_ports "$raw"); then
       err "Invalid list. Use numbers 1-65535 separated by commas (ranges like 8000-8100 are allowed)."
       continue
     fi
-    for p in $(ssh_ports); do
-      [[ $p =~ ^[0-9]+$ ]] || continue
-      if ports_include "$norm" "$p"; then
-        err "Port $p is the SSH port of this server - forwarding it would lock you out. Remove it."
-        continue 2
-      fi
-    done
+    if [[ $rev != rev ]]; then
+      for p in $(ssh_ports); do
+        [[ $p =~ ^[0-9]+$ ]] || continue
+        if ports_include "$norm" "$p"; then
+          err "Port $p is the SSH port of this server - forwarding it would lock you out. Remove it."
+          continue 2
+        fi
+      done
+    fi
     if [[ $ENGINE == backhaul ]]; then
       cnt=$(expand_ports "$norm" | wc -l)
       if (( cnt > MAX_FWD_PORTS )); then
         err "$cnt ports requested - Backhaul opens one listener per port, the limit here is $MAX_FWD_PORTS."
         continue
       fi
-      if ports_include "$norm" "$BH_PORT"; then
-        err "Port $BH_PORT is reserved for the Backhaul control channel. Remove it."
-        continue
-      fi
+      for p in "$BH_PORT" "$BH_PORT_REV"; do
+        if ports_include "$norm" "$p"; then
+          err "Port $p is reserved for a Backhaul control channel. Remove it."
+          continue 2
+        fi
+      done
       if [[ $MODE == udp ]] && ports_include "$norm" "$UDP_PORT"; then
         err "Port $UDP_PORT is used by the ESP-in-UDP transport itself. Remove it from the list."
         continue
       fi
-      busy=$(busy_ports "$norm")
-      if [[ -n $busy ]]; then
-        err "Already used by a local service on this server: ${busy}- Backhaul could not open them. Free them or choose other ports."
-        continue
+      if [[ $rev != rev ]]; then          # the Kharej ports are checked on the Kharej server during its install
+        busy=$(busy_ports "$norm")
+        if [[ -n $busy ]]; then
+          err "Already used by a local service on this server: ${busy}- Backhaul could not open them. Free them or choose other ports."
+          continue
+        fi
       fi
     fi
-    PORTS=$norm
     break
   done
+  if [[ $rev == rev ]]; then PORTS_REV=$norm; else PORTS=$norm; fi
   if [[ $ENGINE != backhaul ]]; then
     IFS=',' read -ra sp <<< "$PORTS"
     for spec in "${sp[@]}"; do
@@ -1851,26 +2112,93 @@ ask_transport() {
   fi
 }
 
-# IP version of the connection between the two servers (the outer packets of the ESP tunnel).
-# Chosen on the Iran server; the Kharej side follows the token (and its own Iran-IP answer).
-ask_ip_family() {
-  local c def=1
-  [[ ${FAM:-4} == 6 ]] && def=2
+# Public addresses (IPv4 and IPv6) of the two servers - Iran server: all four are asked.
+ask_addresses_iran() {
+  local d4=${IRAN_IP:-} d6=${IRAN_IP6:-} k4=${KHAREJ_IP:-} k6=${KHAREJ_IP6:-}
+  [[ -n $d4 ]] || d4=$(detect_public_ip 4)
+  [[ -n $d6 ]] || d6=$(detect_public_ip 6)
   echo
-  echo "IP version of the connection between the two servers:"
-  echo "  1) IPv4 (default)"
-  echo "  2) IPv6   (both servers need a working public IPv6 address and route; ESP-in-UDP needs Linux >= 5.8;"
-  echo "             the tunnel addresses inside stay 10.10.10.1 / 10.10.10.2)"
+  echo "Public addresses of the two servers. Give IPv4, IPv6 or both - with both, the tunnel can use either one."
+  echo "Enter = the value in [brackets];  '-' = none."
+  while true; do
+    IRAN_IP=$(ask_addr_opt   "Iran   server public IPv4 [${d4:-none}]: " "$d4" 4)
+    IRAN_IP6=$(ask_addr_opt  "Iran   server public IPv6 [${d6:-none}]: " "$d6" 6)
+    KHAREJ_IP=$(ask_addr_opt "Kharej server public IPv4 [${k4:-none}]: " "$k4" 4)
+    KHAREJ_IP6=$(ask_addr_opt "Kharej server public IPv6 [${k6:-none}]: " "$k6" 6)
+    calc_have
+    if (( HAVE4 || HAVE6 )); then break; fi
+    err "No IP version has an address on BOTH servers - fill IPv4 or IPv6 (or both) for the Iran AND the Kharej server."
+    d4=$IRAN_IP; d6=$IRAN_IP6; k4=$KHAREJ_IP; k6=$KHAREJ_IP6
+  done
+  if [[ -n $IRAN_IP || -n $KHAREJ_IP ]] && (( ! HAVE4 )); then warn "IPv4 is missing on one of the servers - IPv4 will not be used."; fi
+  if [[ -n $IRAN_IP6 || -n $KHAREJ_IP6 ]] && (( ! HAVE6 )); then warn "IPv6 is missing on one of the servers - IPv6 will not be used."; fi
+  return 0
+}
+
+# Kharej server: the Iran server's IPv4 + IPv6 are asked (defaults = the token); this server's own
+# addresses, the primary IP version and the fail-over switch come from the token (parse_token first).
+ask_addresses_kharej() {
+  local d4=$T_IRAN4 d6=$T_IRAN6
+  KHAREJ_IP=$T_KHAREJ4; KHAREJ_IP6=$T_KHAREJ6
+  echo
+  echo "Public addresses of the IRAN server - this server connects to them. Give IPv4, IPv6 or both."
+  echo "Enter = the value from the token [in brackets];  '-' = none."
+  while true; do
+    IRAN_IP=$(ask_addr_opt  "Iran server public IPv4 [${d4:-none}]: " "$d4" 4)
+    IRAN_IP6=$(ask_addr_opt "Iran server public IPv6 [${d6:-none}]: " "$d6" 6)
+    calc_have
+    if (( HAVE4 || HAVE6 )); then break; fi
+    err "No IP version has an address on BOTH servers. This server's addresses (from the token): IPv4 ${KHAREJ_IP:-none}, IPv6 ${KHAREJ_IP6:-none}."
+    err "Enter the Iran address in an IP version this server has - or fix the addresses on the Iran server (menu 15) and paste the new token."
+    d4=$IRAN_IP; d6=$IRAN_IP6
+  done
+  PRI_FAM=$T_PRI; FAILOVER=$T_FAILOVER
+  case $PRI_FAM in
+    4) (( HAVE4 )) || { PRI_FAM=6; warn "The token prefers IPv4, but no IPv4 pair is complete here - starting on IPv6."; } ;;
+    *) (( HAVE6 )) || { PRI_FAM=4; warn "The token prefers IPv6, but no IPv6 pair is complete here - starting on IPv4."; } ;;
+  esac
+  (( ALT )) || FAILOVER=0
+  apply_family "$PRI_FAM"
+  return 0
+}
+
+# Primary IP version + automatic fail-over (Iran server; only when both versions are complete)
+ask_primary_family() {
+  local c def=1
+  if (( ! ALT )); then
+    if (( HAVE4 )); then PRI_FAM=4; else PRI_FAM=6; fi
+    FAILOVER=0
+    apply_family "$PRI_FAM"
+    ok "Connection between the servers: IPv${PRI_FAM}"
+    return 0
+  fi
+  [[ ${PRI_FAM:-4} == 6 ]] && def=2
+  echo
+  echo "IPv4 and IPv6 are both available between the servers. Which one should the tunnel use first?"
+  echo "  1) IPv4 (default)   2) IPv6   (ESP-in-UDP over IPv6 needs Linux >= 5.8 on both servers)"
   while true; do
     read -r -p "Select [${def}]: " c
     case ${c:-$def} in
-      1|4) FAM=4 ;;
-      2|6) FAM=6 ;;
+      1|4) PRI_FAM=4 ;;
+      2|6) PRI_FAM=6 ;;
       *) err "Invalid choice."; continue ;;
     esac
     break
   done
-  ok "Connection between the servers: IPv${FAM}"
+  echo "Automatic fail-over: when the link stays dead, BOTH servers switch to the other IP version (aligned by the"
+  echo "UTC clock, every ${HUNT_SLOT}s) until it works - no action needed. Both clocks must be right (menu 13)."
+  if confirm "Enable automatic IPv4 <-> IPv6 fail-over?" y; then FAILOVER=1; else FAILOVER=0; fi
+  apply_family "$PRI_FAM"
+  ok "Primary IP version: IPv${PRI_FAM}, fail-over $( (( FAILOVER )) && echo on || echo off )"
+}
+
+# take the non-address settings of the parsed token (ports of both directions, transport, targets)
+adopt_token_settings() {
+  MODE=$T_MODE; UDP_PORT=$T_UDP; PORTS=$(norm_ports "$T_PORTS"); FWD_PROTO=$T_PROTO
+  BH_PORT=$T_BHPORT; BH_TRANSPORT=$T_BHTR; BH_TARGET=$T_BHTARGET
+  PORTS_REV=""; [[ -z $T_PORTS_REV ]] || PORTS_REV=$(norm_ports "$T_PORTS_REV")
+  FWD_PROTO_REV=$T_PROTO_REV; BH_TARGET_REV=$T_TARGET_REV; BH_PORT_REV=$T_BHPORT_REV
+  return 0
 }
 
 # Backhaul transport = the protocol of the reverse tunnel that runs INSIDE the ESP tunnel.
@@ -1907,27 +2235,28 @@ ask_bh_transport() {
   ok "Backhaul transport: ${BH_TRANSPORT}"
 }
 
-ask_fwd_proto() {
-  local c
+ask_fwd_proto() {   # ask_fwd_proto [rev]
+  local rev=${1:-} c res=both
   if [[ $ENGINE == backhaul ]]; then
     case $BH_TRANSPORT in
       tcp)
         echo
-        echo "Forward which protocol on those ports?"
+        if [[ $rev == rev ]]; then echo "Kharej -> Iran direction: forward which protocol on those ports?"; else echo "Forward which protocol on those ports?"; fi
         echo "  1) TCP + UDP (default - UDP is carried inside the TCP tunnel)   2) TCP only"
         echo "  (Backhaul always opens TCP on the listed ports, so there is no 'UDP only' option)"
         read -r -p "Select [1]: " c
-        case $c in 2) FWD_PROTO=tcp ;; *) FWD_PROTO=both ;; esac
+        case $c in 2) res=tcp ;; *) res=both ;; esac
         ;;
       udp)
-        FWD_PROTO=both
+        res=both
         info "UDP transport: what it carries is decided by Backhaul's udp transport - test your service after the install."
         ;;
       *)
-        FWD_PROTO=tcp
+        res=tcp
         info "The ${BH_TRANSPORT} transport carries TCP only (UDP forwarding needs the tcp transport)."
         ;;
     esac
+    if [[ $rev == rev ]]; then FWD_PROTO_REV=$res; else FWD_PROTO=$res; fi
     return 0
   fi
   echo
@@ -1939,23 +2268,34 @@ ask_fwd_proto() {
 
 # Where the forwarded services listen on the Kharej server. Backhaul keeps the destination in the
 # server (Iran) config, so it is asked on the Iran side and travels in the token.
-ask_bh_target() {
-  local a def=${BH_TARGET:-127.0.0.1}
+ask_bh_target() {   # ask_bh_target [rev]
+  local rev=${1:-} a def
   echo
-  echo "Where do the forwarded services listen on the KHAREJ server?"
-  echo "  127.0.0.1 works for services bound to 127.0.0.1 or 0.0.0.0."
-  echo "  Use ${IP_KHAREJ} only if they listen exclusively on the tunnel address."
+  if [[ $rev == rev ]]; then
+    def=${BH_TARGET_REV:-127.0.0.1}
+    echo "Kharej -> Iran direction: where do the forwarded services listen on the IRAN server?"
+    echo "  127.0.0.1 works for services bound to 127.0.0.1 or 0.0.0.0."
+    echo "  Use ${IP_IRAN} only if they listen exclusively on the tunnel address."
+  else
+    def=${BH_TARGET:-127.0.0.1}
+    echo "Where do the forwarded services listen on the KHAREJ server?"
+    echo "  127.0.0.1 works for services bound to 127.0.0.1 or 0.0.0.0."
+    echo "  Use ${IP_KHAREJ} only if they listen exclusively on the tunnel address."
+  fi
   while true; do
     read -r -p "Target address [${def}]: " a
     a=${a:-$def}
-    if valid_ip "$a"; then BH_TARGET=$a; return 0; fi
+    if valid_ip "$a"; then
+      if [[ $rev == rev ]]; then BH_TARGET_REV=$a; else BH_TARGET=$a; fi
+      return 0
+    fi
     err "Invalid IPv4 address."
   done
 }
 
 fw_hint() {
   local v=""
-  [[ $FAM == 6 ]] && v=" for IPv6"
+  if (( HAVE4 && HAVE6 )); then v=", IPv4 and IPv6"; elif (( HAVE6 )); then v=", IPv6"; fi
   if [[ $MODE == udp ]]; then
     echo "Open UDP ${UDP_PORT} (in and out${v}) in your provider's external / cloud firewall if it has one."
   else
@@ -1986,6 +2326,7 @@ print_token() {
   echo "$tok"
   echo "${C_Y}=================================================================================${C_0}"
   echo "Copy it to the Kharej server: run this script there -> option 2 -> paste the token."
+  echo "It carries the addresses of both servers (IPv4 + IPv6) and the port lists of BOTH forwarding directions."
   echo "Send it over a secure channel (SSH/SCP). Anyone with the token can decrypt the tunnel."
 }
 
@@ -2015,7 +2356,7 @@ pmtu_scan() {
 }
 
 diagnose() {
-  local out loss dev n_pol n_sa k v d x fw_ok bhc=""
+  local out loss dev n_pol n_sa k v d x fw_ok bdir bcnt bh_bad=""
   local o0=0 i0=0 o1=0 i1=0 r0=0 r1=0 d_out=0 d_in=0 d_rx=0
   local pr_ok=0 pr_n=5 pr_rtt="-" pr_skew="-" have_probe=0 skew_abs=0 cause="" nz="" cur_mtu=0 mtu_warn=""
   local -A XB=()
@@ -2023,7 +2364,7 @@ diagnose() {
   if ! load_config 2>/dev/null; then warn "Tunnel is not installed."; return; fi
   route_info "$PEER_PUB" >/dev/null 2>&1
   echo "${C_B}=================== ESP tunnel diagnosis ===================${C_0}"
-  echo "Role ${ROLE}:  ${LOCAL_INNER} <-> ${PEER_INNER}      peer public IP ${PEER_PUB}"
+  echo "Role ${ROLE}:  ${LOCAL_INNER} <-> ${PEER_INNER}      peer public IP ${PEER_PUB} (IPv${FAM}$( (( ALT && FAILOVER )) && echo ", fail-over on" ))"
   if [[ $MODE == udp ]]; then echo "Transport: ESP-in-UDP on port ${UDP_PORT}"; else echo "Transport: raw ESP (IP protocol 50)"; fi
   clock_status
   echo
@@ -2103,15 +2444,19 @@ diagnose() {
     row "XFRM errors" "none during the test"
   fi
   if [[ $ENGINE == backhaul ]]; then
-    bhc=$(bh_conn_count)
-    row "Backhaul" "service $(systemctl is-active "$BH_UNIT" 2>/dev/null), transport ${BH_TRANSPORT}, connections on ${IP_IRAN}:${BH_PORT}: ${bhc}"
+    for bdir in $(bh_dirs); do
+      bh_dir "$bdir"
+      bcnt=$(bh_conn_count "$bdir")
+      row "Backhaul ${bdir}" "service $(systemctl is-active "$D_UNIT" 2>/dev/null), transport ${BH_TRANSPORT}, connections on ${D_CIP}:${D_CPORT}: ${bcnt}"
+      if ! systemctl is-active --quiet "$D_UNIT" 2>/dev/null || [[ $bcnt == 0 ]]; then bh_bad+="${bdir} "; fi
+    done
   fi
   echo
 
   if [[ -n $loss ]] && (( loss == 0 )); then
     echo "${C_G}Verdict: the tunnel works (0% packet loss).${C_0}"
-    if [[ $ENGINE == backhaul ]] && { ! systemctl is-active --quiet "$BH_UNIT" 2>/dev/null || [[ $bhc == 0 ]]; }; then
-      warn "...but the Backhaul reverse tunnel is not connected: journalctl -u ${BH_UNIT} -n 30 --no-pager"
+    if [[ -n $bh_bad ]]; then
+      warn "...but the Backhaul reverse tunnel is not connected in: ${bh_bad}- see: journalctl -u ${BH_UNIT} -n 30 --no-pager   (rev: journalctl -u ${BH_UNIT_REV} ...)"
     fi
     [[ -n $mtu_warn ]] && warn "...but ${mtu_warn}"
     return
@@ -2178,50 +2523,70 @@ sync_clock() {
 #  Menu actions
 # ------------------------------------------------------------------------------
 setup_iran() {
-  local det
+  local own
   confirm_reinstall || return
   install_self || { pause; return; }
 
   echo
   info "Setting up the IRAN server side (tunnel IP ${IP_IRAN}, Backhaul server)"
-  ROLE=iran; ENGINE=backhaul; BH_PORT=$DEFAULT_BH_PORT; BH_TARGET=127.0.0.1
+  ROLE=iran; ENGINE=backhaul; BH_PORT=$DEFAULT_BH_PORT; BH_PORT_REV=$DEFAULT_BH_PORT_REV
+  BH_TARGET=127.0.0.1; BH_TARGET_REV=127.0.0.1; PORTS=""; PORTS_REV=""
   ask_transport
   ask_bh_transport
-  ask_ip_family
-  ensure_deps     || { pause; return; }
-  preflight_check || { pause; return; }
-  check_kernel    || { pause; return; }
-  ensure_backhaul || { pause; return; }
+  ask_addresses_iran
+  ask_primary_family
+  ensure_deps      || { pause; return; }
+  preflight_check  || { pause; return; }
+  check_kernel_all || { pause; return; }
+  ensure_backhaul  || { pause; return; }
   cron_warn
 
-  det=$(detect_public_ip "$FAM")
-  IRAN_IP=$(ask_addr "Iran server public IPv${FAM} [${det}]: " "$det" "$FAM")
-  KHAREJ_IP=$(ask_addr "Kharej (foreign) server public IPv${FAM}: " "" "$FAM")
-  if ! route_info "$KHAREJ_IP"; then err "No route to $KHAREJ_IP from this server."; pause; return; fi
-  if [[ $LOCAL_ADDR != "$IRAN_IP" ]]; then
-    warn "This server's local address towards Kharej is $LOCAL_ADDR, not $IRAN_IP (NAT?)."
-    warn "Raw ESP through NAT often fails - if it does, re-install using ESP-in-UDP."
+  apply_family "$PRI_FAM"
+  if route_info "$PEER_PUB"; then
+    if [[ $FAM == 6 ]]; then own=$IRAN_IP6; else own=$IRAN_IP; fi
+    if [[ $LOCAL_ADDR != "$own" ]]; then
+      warn "This server's local address towards Kharej is $LOCAL_ADDR, not $own (NAT?)."
+      warn "Raw ESP through NAT often fails - if it does, re-install using ESP-in-UDP."
+    fi
+  elif (( ALT )); then
+    warn "No route to $PEER_PUB over IPv${FAM} from this server - the tunnel needs IPv${FAM} connectivity (or the fail-over to IPv$(( 10 - FAM )))."
+  else
+    err "No route to $PEER_PUB from this server."; pause; return
   fi
 
   echo
+  info "Forwarding Iran -> Kharej: ports opened on THIS (Iran) server and delivered to the Kharej server"
   ask_ports
   ask_fwd_proto
   ask_bh_target
+  ask_ports rev
+  if [[ -n $PORTS_REV ]]; then
+    ask_fwd_proto rev
+    ask_bh_target rev
+  fi
 
   ROLE=iran
   MASTER=$(rand_hex 32)
   FORCE_REBUILD_SEC=$DEFAULT_FORCE_REBUILD_SEC
   RX_STALL_SEC=$DEFAULT_RX_STALL_SEC
+  rm -f "$FAM_FILE"
   write_config
   load_config
   start_service || { pause; return; }
   print_token
   echo
-  echo "Reverse tunnel: the Backhaul server on this box listens on ${IP_IRAN}:${BH_PORT} (inside the ESP tunnel only), transport: ${BH_TRANSPORT}."
-  echo "Public ports [${PORTS}] (${FWD_PROTO}) are opened by Backhaul and carried through the tunnel to ${BH_TARGET}:<same port> on the Kharej server."
-  echo "The Kharej side takes the transport from the token - run option 2 there with the token above."
+  echo "Backhaul transport: ${BH_TRANSPORT}.  Both directions run inside the ESP tunnel only (never on the public network):"
+  echo "  Iran -> Kharej : the Backhaul server here listens on ${IP_IRAN}:${BH_PORT}; ports [${PORTS}] (${FWD_PROTO}) are opened on THIS server"
+  echo "                   and delivered to ${BH_TARGET}:<same port> on the Kharej server."
+  if [[ -n $PORTS_REV ]]; then
+    echo "  Kharej -> Iran : the Backhaul server on the Kharej side listens on ${IP_KHAREJ}:${BH_PORT_REV}; ports [${PORTS_REV}] (${FWD_PROTO_REV})"
+    echo "                   are opened on the Kharej server and delivered to ${BH_TARGET_REV}:<same port> on THIS server."
+  else
+    echo "  Kharej -> Iran : not used (no ports given; add some later with menu 6)."
+  fi
+  echo "The Kharej side takes everything from the token - run option 2 there with the token above."
   if [[ $BH_TRANSPORT == wss || $BH_TRANSPORT == wssmux ]]; then
-    echo "TLS: a self-signed certificate was created in ${CONF_DIR} (the Kharej client does not verify it)."
+    echo "TLS: self-signed certificates are created automatically (the Backhaul clients do not verify them)."
   fi
   if have ufw && ufw status 2>/dev/null | grep -qi '^Status: active'; then
     warn "ufw is active here: allow the forwarded ports too (ufw allow <port>)."
@@ -2233,7 +2598,7 @@ setup_iran() {
 }
 
 setup_kharej() {
-  local tok
+  local tok busy own
   confirm_reinstall || return
   install_self || { pause; return; }
 
@@ -2244,45 +2609,48 @@ setup_kharej() {
     if parse_token "$tok"; then break; fi
     err "Invalid token (copy error?). Copy it again from the Iran server (menu option 8). Tokens made by the old Rathole version are not valid - create a new one on the Iran server."
   done
-  ROLE=kharej
-  MODE=$T_MODE; UDP_PORT=$T_UDP; ENGINE=$T_ENGINE; BH_PORT=$T_BHPORT; BH_TRANSPORT=$T_BHTR; BH_TARGET=$T_BHTARGET
-
-  # The Kharej server connects to the Iran server: ask for its public IP (IPv4 or IPv6).
-  # Enter = the address stored in the token.
-  echo
-  echo "Public IP of the IRAN server - the Kharej server connects to it (IPv4 or IPv6)."
-  echo "The token says: ${T_IRAN}  (press Enter to use it, or type another address)."
-  IRAN_IP=$(ask_addr "Iran server public IP [${T_IRAN}]: " "$T_IRAN")
-  FAM=$(addr_fam "$IRAN_IP")
-  if [[ $FAM != "$(addr_fam "$T_KHAREJ")" ]]; then
-    err "The token was made for IPv$(addr_fam "$T_KHAREJ") (Kharej ${T_KHAREJ}) but ${IRAN_IP} is an IPv${FAM} address."
-    err "Both servers must use the same IP version. To switch: run menu 15 on the Iran server, then paste the NEW token here."
-    pause; return
-  fi
-  info "Connection between the servers: IPv${FAM}  (Iran ${IRAN_IP})"
-
-  ensure_deps     || { pause; return; }
-  preflight_check || { pause; return; }
-  check_kernel    || { pause; return; }
+  ROLE=kharej; MASTER=$T_MASTER; ENGINE=$T_ENGINE
+  adopt_token_settings
+  ask_addresses_kharej
+  ensure_deps      || { pause; return; }
+  preflight_check  || { pause; return; }
+  check_kernel_all || { pause; return; }
   if [[ $ENGINE == backhaul ]]; then
     ensure_backhaul || { pause; return; }
   fi
   cron_warn
 
-  KHAREJ_IP=$T_KHAREJ
-  PORTS=$(norm_ports "$T_PORTS"); FWD_PROTO=$T_PROTO; MASTER=$T_MASTER; ROLE=kharej
   FORCE_REBUILD_SEC=$DEFAULT_FORCE_REBUILD_SEC
   RX_STALL_SEC=$DEFAULT_RX_STALL_SEC
-
-  if ! route_info "$IRAN_IP"; then err "No route to Iran server $IRAN_IP."; pause; return; fi
-  if [[ $LOCAL_ADDR != "$KHAREJ_IP" ]]; then
-    warn "This server's local address is $LOCAL_ADDR but the token says $KHAREJ_IP (NAT or wrong server?)."
-    confirm "Continue anyway?" n || return
+  apply_family "$PRI_FAM"
+  if route_info "$PEER_PUB"; then
+    if [[ $FAM == 6 ]]; then own=$KHAREJ_IP6; else own=$KHAREJ_IP; fi
+    if [[ $LOCAL_ADDR != "$own" ]]; then
+      warn "This server's local address is $LOCAL_ADDR but the token says $own (NAT or wrong server?)."
+      confirm "Continue anyway?" n || return
+    fi
+  elif (( ALT )); then
+    warn "No route to the Iran server $PEER_PUB over IPv${FAM} from this server - the tunnel needs IPv${FAM} connectivity (or the fail-over to IPv$(( 10 - FAM )))."
+  else
+    err "No route to Iran server $PEER_PUB."; pause; return
   fi
   if [[ $ENGINE == backhaul ]]; then
     info "Backhaul transport (from the token): ${BH_TRANSPORT}"
+    if [[ -n $PORTS_REV ]]; then
+      # this server OPENS the Kharej -> Iran ports: they must be free here
+      busy=$(busy_ports "$PORTS_REV")
+      if [[ -n $busy ]]; then
+        warn "Kharej -> Iran ports already used by a local service on THIS server: ${busy}- Backhaul could not open them."
+        confirm "Continue anyway?" n || return
+      fi
+      if [[ $MODE == udp ]] && ports_include "$PORTS_REV" "$UDP_PORT"; then
+        err "Port $UDP_PORT (ESP-in-UDP) is in the Kharej -> Iran port list. Change the list on the Iran server (menu 6) and paste a new token."
+        pause; return
+      fi
+    fi
   fi
 
+  rm -f "$FAM_FILE"
   write_config
   load_config
   start_service || { pause; return; }
@@ -2290,18 +2658,18 @@ setup_kharej() {
   echo
   info "Waiting for the tunnel to come up (up to 20 s)..."
   if wait_link 20; then
-    ok "Tunnel is UP - ${PEER_INNER} answers ping."
+    ok "Tunnel is UP - ${PEER_INNER} answers ping (IPv${FAM})."
     if [[ $ENGINE == backhaul ]]; then
       if [[ $BH_TRANSPORT == udp ]]; then
         info "UDP transport has no connection counter - check the log: journalctl -u ${BH_UNIT} -n 30 --no-pager"
       else
         info "Waiting for the Backhaul reverse tunnel (${IP_KHAREJ} -> ${IP_IRAN}:${BH_PORT})..."
         for _ in $(seq 1 12); do
-          [[ $(bh_conn_count) != 0 ]] && break
+          [[ $(bh_conn_count fwd) != 0 ]] && break
           sleep 1
         done
-        if [[ $(bh_conn_count) != 0 ]]; then
-          ok "Reverse tunnel is connected."
+        if [[ $(bh_conn_count fwd) != 0 ]]; then
+          ok "Reverse tunnel (Iran -> Kharej) is connected."
         else
           warn "Not connected yet. See: journalctl -u ${BH_UNIT} -n 30 --no-pager"
         fi
@@ -2314,8 +2682,12 @@ setup_kharej() {
   fi
   echo
   if [[ $ENGINE == backhaul ]]; then
-    echo "Ports [${PORTS}] (${FWD_PROTO}) opened on the Iran server are forwarded to ${BH_TARGET}:<same port> on THIS server."
-    echo "The services must be running here and listening on ${BH_TARGET} (or 0.0.0.0)."
+    echo "Iran -> Kharej : ports [${PORTS}] (${FWD_PROTO}) opened on the Iran server are delivered to ${BH_TARGET}:<same port> on THIS server."
+    echo "                 The services must be running here and listening on ${BH_TARGET} (or 0.0.0.0)."
+    if [[ -n $PORTS_REV ]]; then
+      echo "Kharej -> Iran : ports [${PORTS_REV}] (${FWD_PROTO_REV}) are opened on THIS server (Backhaul server on ${IP_KHAREJ}:${BH_PORT_REV})"
+      echo "                 and delivered to ${BH_TARGET_REV}:<same port> on the Iran server."
+    fi
   else
     echo "Services for ports [${PORTS}] on this server must listen on 0.0.0.0 or ${IP_KHAREJ}."
     echo "Traffic arrives from ${IP_IRAN} (the Iran server's tunnel IP)."
@@ -2326,7 +2698,7 @@ setup_kharej() {
 }
 
 cmd_status() {
-  local st epoch left line st_bh
+  local st epoch left line st_bh d fo
   if ! load_config 2>/dev/null; then
     warn "Tunnel is not installed. Use menu option 1 (Iran) or 2 (Kharej)."
     return
@@ -2334,10 +2706,14 @@ cmd_status() {
   st=$(systemctl is-active "$APP" 2>/dev/null)
   epoch=$(( $(date +%s) / EPOCH_LEN ))
   left=$(( EPOCH_LEN - $(date +%s) % EPOCH_LEN ))
+  if (( ! ALT )); then fo="n/a (one IP version configured)"; elif (( FAILOVER )); then fo="on"; else fo="off"; fi
 
   echo "${C_B}===================== ESP Tunnel status =====================${C_0}"
   echo "Role          : $ROLE   (${LOCAL_INNER}  <->  ${PEER_INNER})"
   echo "Peer public IP: $PEER_PUB   (outer packets over IPv${FAM})"
+  echo "Addresses     : Iran   IPv4 ${IRAN_IP:-none}   IPv6 ${IRAN_IP6:-none}"
+  echo "                Kharej IPv4 ${KHAREJ_IP:-none}   IPv6 ${KHAREJ_IP6:-none}"
+  echo "IP version    : IPv${FAM} in use, primary IPv${PRI_FAM}, IPv4/IPv6 fail-over: ${fo}"
   if [[ $MODE == udp ]]; then echo "Transport     : ESP-in-UDP, port $UDP_PORT"
   else echo "Transport     : raw ESP (IP protocol 50)"; fi
   echo "Cipher        : AES-256-GCM, MTU $(cat "/sys/class/net/${IF_NAME}/mtu" 2>/dev/null || echo "$MTU"), next key rotation in $((left / 60)) min (epoch $epoch)"
@@ -2345,12 +2721,15 @@ cmd_status() {
   echo "Watchdog      : rx-stall trigger ${RX_STALL_SEC}s, preventive rebuild $( (( FORCE_REBUILD_SEC > 0 )) && echo "every $((FORCE_REBUILD_SEC/3600))h" || echo disabled)"
   if [[ $st == active ]]; then echo "Service       : ${C_G}active${C_0}"; else echo "Service       : ${C_R}${st}${C_0}"; fi
   if [[ $ENGINE == backhaul ]]; then
-    st_bh=$(systemctl is-active "$BH_UNIT" 2>/dev/null)
-    if [[ $st_bh == active ]]; then
-      echo "Backhaul      : ${C_G}active${C_0} ($( [[ $ROLE == iran ]] && echo server || echo client ), transport ${BH_TRANSPORT}, core v$(bh_version), control ${IP_IRAN}:${BH_PORT}, live connections: $(bh_conn_count))"
-    else
-      echo "Backhaul      : ${C_R}${st_bh}${C_0}"
-    fi
+    for d in $(bh_dirs); do
+      bh_dir "$d"
+      st_bh=$(systemctl is-active "$D_UNIT" 2>/dev/null)
+      if [[ $st_bh == active ]]; then
+        echo "Backhaul ${D_NAME}  : ${C_G}active${C_0} ($( (( D_SERVER )) && echo server || echo client ), transport ${BH_TRANSPORT}, core v$(bh_version), control ${D_CIP}:${D_CPORT}, live connections: $(bh_conn_count "$d"))"
+      else
+        echo "Backhaul ${D_NAME}  : ${C_R}${st_bh}${C_0}"
+      fi
+    done
   else
     echo "Forwarding    : iptables DNAT (legacy engine - re-install to switch to Backhaul)"
   fi
@@ -2377,13 +2756,14 @@ cmd_status() {
   fi
   if [[ $ENGINE == backhaul ]]; then
     echo
-    echo "--- Forwarded ports (${FWD_PROTO}) : [${PORTS}] ---"
-    if [[ $ROLE == iran ]]; then
-      echo "Public ports listening: $(bh_listen_summary)   (Backhaul may open a port only while the Kharej client is connected)"
-      echo "Target on Kharej      : ${BH_TARGET}"
+    echo "--- Forwarded ports (two-way) ---"
+    echo "Iran -> Kharej : [${PORTS}] (${FWD_PROTO}) opened on the Iran server, delivered to ${BH_TARGET}:<same port> on Kharej$( [[ $ROLE == iran ]] && echo ";  listening here: $(bh_listen_summary fwd)" )"
+    if [[ -n $PORTS_REV ]]; then
+      echo "Kharej -> Iran : [${PORTS_REV}] (${FWD_PROTO_REV}) opened on the Kharej server, delivered to ${BH_TARGET_REV}:<same port> on Iran$( [[ $ROLE == kharej ]] && echo ";  listening here: $(bh_listen_summary rev)" )"
     else
-      echo "Target on this server : ${BH_TARGET}"
+      echo "Kharej -> Iran : not used"
     fi
+    echo "(Backhaul may open a port only while the other side's client is connected)"
   elif [[ $ROLE == iran ]]; then
     echo
     echo "--- Forwarded ports (${FWD_PROTO}) : [${PORTS}] -> ${IP_KHAREJ} ---"
@@ -2421,7 +2801,8 @@ live_log() {
   echo "  2) Live ping monitor (packet loss + latency/jitter through the tunnel)"
   echo "  3) Live traffic counters (kbit/s, pps, errors)"
   echo "  4) Diagnose connection now (same as menu 11)"
-  echo "  5) Backhaul log (reverse tunnel)"
+  echo "  5) Backhaul log - Iran -> Kharej direction"
+  echo "  6) Backhaul log - Kharej -> Iran direction"
   read -r -p "Select [1]: " c
   case ${c:-1} in
     1) echo "(Ctrl+C to return)"; trap ':' INT; journalctl -u "$APP" -f -n 40 --no-pager; trap - INT ;;
@@ -2433,27 +2814,32 @@ live_log() {
        else
          warn "This install does not use Backhaul."
        fi ;;
+    6) if [[ $ENGINE == backhaul && -n $PORTS_REV ]]; then
+         echo "(Ctrl+C to return)"; trap ':' INT; journalctl -u "$BH_UNIT_REV" -f -n 40 --no-pager; trap - INT
+       else
+         warn "The Kharej -> Iran direction is not used on this install."
+       fi ;;
     *) warn "Invalid choice." ;;
   esac
 }
 
 uninstall_all() {
   confirm "Remove the tunnel completely (services, Backhaul core, interface, keys, firewall rules)?" n || return
-  systemctl disable --now "$BH_UNIT" >/dev/null 2>&1
+  systemctl disable --now "$BH_UNIT" "$BH_UNIT_REV" >/dev/null 2>&1
   systemctl disable --now "${APP}-rathole" >/dev/null 2>&1       # unit of the old Rathole version, if any
   systemctl disable --now "$APP" >/dev/null 2>&1
   teardown_all
   tune_restore
-  rm -f "$UNIT_FILE" "$BH_UNIT_FILE" "/etc/systemd/system/${APP}-rathole.service" "$SYSCTL_FILE"
+  rm -f "$UNIT_FILE" "$BH_UNIT_FILE" "$BH_UNIT_FILE_REV" "/etc/systemd/system/${APP}-rathole.service" "$SYSCTL_FILE"
   rm -rf "$CONF_DIR" "$RUN_DIR" "$LIB_DIR"
   systemctl daemon-reload
-  systemctl reset-failed "$APP" "$BH_UNIT" "${APP}-rathole" 2>/dev/null
+  systemctl reset-failed "$APP" "$BH_UNIT" "$BH_UNIT_REV" "${APP}-rathole" 2>/dev/null
   rm -f "$BIN"
   ok "Tunnel fully removed (net.ipv4.ip_forward was left unchanged)."
 }
 
 change_ports() {
-  local tok
+  local tok busy
   load_config 2>/dev/null || { warn "Tunnel is not installed."; return; }
 
   if [[ $ENGINE != backhaul ]]; then      # legacy iptables engine
@@ -2470,30 +2856,42 @@ change_ports() {
   fi
 
   if [[ $ROLE == iran ]]; then
-    info "Current ports: [${PORTS}] (${FWD_PROTO}), target on Kharej ${BH_TARGET}, Backhaul transport ${BH_TRANSPORT}"
+    info "Iran -> Kharej : [${PORTS}] (${FWD_PROTO}), target on Kharej ${BH_TARGET}"
+    info "Kharej -> Iran : [${PORTS_REV:-none}] (${FWD_PROTO_REV}), target on Iran ${BH_TARGET_REV}"
+    info "Backhaul transport: ${BH_TRANSPORT}"
     ask_ports
     ask_fwd_proto
     ask_bh_target
+    ask_ports rev
+    if [[ -n $PORTS_REV ]]; then
+      ask_fwd_proto rev
+      ask_bh_target rev
+    fi
     write_config
-    bh_write_config || return
-    systemctl restart "$BH_UNIT" && ok "Backhaul restarted with the new port list."
-    warn "The port list lives in the Backhaul server on THIS (Iran) server - the Kharej client needs no update."
-    warn "To refresh the port list shown by the Kharej status, run this option (6) there and paste the token below."
+    start_backhaul && ok "Backhaul restarted with the new port lists."
+    warn "The Iran -> Kharej list lives on THIS server - nothing to do on the Kharej side for it."
+    warn "The Kharej -> Iran ports are opened by the Kharej server: run this option (6) there and paste the token below (required when that direction changed)."
     print_token
   else
-    info "Current ports (from the Iran token): [${PORTS}] (${FWD_PROTO}), target ${BH_TARGET}"
-    echo "The ports are opened by the Iran server; the Kharej Backhaul client needs no port list."
-    echo "Paste the updated token from the Iran server to refresh the displayed list, or press Enter to keep it."
+    info "Iran -> Kharej : [${PORTS}] (${FWD_PROTO}), target ${BH_TARGET}"
+    info "Kharej -> Iran : [${PORTS_REV:-none}] (${FWD_PROTO_REV}), target on Iran ${BH_TARGET_REV}"
+    echo "Paste the updated token from the Iran server to sync the port lists of both directions."
     read -r -p "Token: " tok
-    if [[ -n $tok ]]; then
-      parse_token "$tok" || { err "Invalid token."; return; }
-      [[ $T_MASTER == "$MASTER" ]] || { err "That token belongs to a different tunnel (key mismatch)."; return; }
-      [[ $T_ENGINE == "$ENGINE" ]] || { err "That token was made for another engine (${T_ENGINE})."; return; }
-      PORTS=$(norm_ports "$T_PORTS"); FWD_PROTO=$T_PROTO; BH_TARGET=$T_BHTARGET
-      [[ $T_BHTR == "$BH_TRANSPORT" ]] || warn "The token carries another Backhaul transport (${T_BHTR}) - use menu 14 to switch it."
-      write_config
-      ok "Port list updated."
+    [[ -n $tok ]] || { info "Nothing changed."; return; }
+    parse_token "$tok" || { err "Invalid token."; return; }
+    [[ $T_MASTER == "$MASTER" ]] || { err "That token belongs to a different tunnel (key mismatch)."; return; }
+    [[ $T_ENGINE == "$ENGINE" ]] || { err "That token was made for another engine (${T_ENGINE})."; return; }
+    adopt_token_settings
+    if [[ -n $PORTS_REV ]]; then          # this server OPENS the Kharej -> Iran ports
+      busy=$(busy_ports "$PORTS_REV")
+      if [[ -n $busy ]]; then
+        warn "Kharej -> Iran ports already used by a local service on THIS server: ${busy}- Backhaul could not open them."
+        confirm "Continue anyway?" n || return
+      fi
     fi
+    write_config
+    "$BIN" fw >/dev/null 2>&1               # the control-port rule of the reverse direction
+    start_backhaul && ok "Backhaul restarted with the synced port lists."
   fi
 }
 
@@ -2504,53 +2902,55 @@ change_bh_transport() {
   if [[ $ENGINE != backhaul ]]; then warn "This install does not use Backhaul (legacy DNAT engine) - re-install to switch."; return; fi
 
   if [[ $ROLE == iran ]]; then
-    info "Current Backhaul transport: ${BH_TRANSPORT}"
+    info "Current Backhaul transport: ${BH_TRANSPORT} (used by both directions)"
     ask_bh_transport
     ask_fwd_proto                      # UDP over the tunnel exists for the tcp transport only
+    [[ -z $PORTS_REV ]] || ask_fwd_proto rev
     ensure_deps || return
     write_config
     load_config
-    bh_write_config || return
-    "$BIN" fw >/dev/null 2>&1          # the control-port rule depends on tcp / udp
+    "$BIN" fw >/dev/null 2>&1          # the control-port rules depend on tcp / udp
     if systemctl is-active --quiet "$APP"; then systemctl kill --signal=HUP --kill-who=main "$APP"; fi
-    systemctl restart "$BH_UNIT" && ok "Backhaul restarted with the transport ${BH_TRANSPORT}."
+    start_backhaul && ok "Backhaul restarted with the transport ${BH_TRANSPORT}."
     print_token
-    warn "Kharej server: run this option (14) and paste the token above. The reverse tunnel stays down until both sides use the same transport."
+    warn "Kharej server: run this option (14) and paste the token above. The reverse tunnels stay down until both sides use the same transport."
   else
     echo "Paste the NEW token shown by the Iran server after it changed the Backhaul transport (Iran: menu 14 or 8)."
     read -r -p "Token: " tok
     parse_token "$tok" || { err "Invalid token."; return; }
     [[ $T_MASTER == "$MASTER" ]] || { err "That token belongs to a different tunnel (key mismatch)."; return; }
     [[ $T_ENGINE == "$ENGINE" ]] || { err "That token was made for another engine (${T_ENGINE})."; return; }
-    BH_TRANSPORT=$T_BHTR; BH_TARGET=$T_BHTARGET; PORTS=$(norm_ports "$T_PORTS"); FWD_PROTO=$T_PROTO
+    adopt_token_settings
+    ensure_deps || return
     write_config
     load_config
-    bh_write_config || return
+    "$BIN" fw >/dev/null 2>&1
     if systemctl is-active --quiet "$APP"; then systemctl kill --signal=HUP --kill-who=main "$APP"; fi
-    systemctl restart "$BH_UNIT" && ok "Backhaul client restarted with the transport ${BH_TRANSPORT}."
+    start_backhaul && ok "Backhaul restarted with the transport ${BH_TRANSPORT}."
   fi
 }
 
 # Change the server IPs / switch the connection between IPv4 and IPv6 on an installed tunnel.
 # Iran first (new token), then Kharej (paste it; it asks for the Iran IP again). Same key, no re-install.
 change_addresses() {
-  local tok det def_i def_k
+  local tok
   load_config 2>/dev/null || { warn "Tunnel is not installed."; return; }
 
   if [[ $ROLE == iran ]]; then
-    info "Current: Iran ${IRAN_IP}  <->  Kharej ${KHAREJ_IP}   (IPv${FAM})"
-    ask_ip_family
-    ensure_deps  || return
-    check_kernel || return
-    det=$(detect_public_ip "$FAM")
-    def_i=$det; [[ $(addr_fam "$IRAN_IP") == "$FAM" ]] && def_i=$IRAN_IP
-    def_k="";   [[ $(addr_fam "$KHAREJ_IP") == "$FAM" ]] && def_k=$KHAREJ_IP
-    IRAN_IP=$(ask_addr "Iran server public IPv${FAM} [${def_i}]: " "$def_i" "$FAM")
-    KHAREJ_IP=$(ask_addr "Kharej server public IPv${FAM} [${def_k}]: " "$def_k" "$FAM")
-    route_info "$KHAREJ_IP" || { err "No route to $KHAREJ_IP from this server (nothing was changed)."; return; }
+    info "Current: Iran IPv4 ${IRAN_IP:-none} / IPv6 ${IRAN_IP6:-none}   <->   Kharej IPv4 ${KHAREJ_IP:-none} / IPv6 ${KHAREJ_IP6:-none}   (primary IPv${PRI_FAM})"
+    ask_addresses_iran
+    ask_primary_family
+    ensure_deps      || return
+    check_kernel_all || return
+    apply_family "$PRI_FAM"
+    if ! route_info "$PEER_PUB"; then
+      if (( ALT )); then warn "No route to $PEER_PUB over IPv${FAM} from this server right now."
+      else err "No route to $PEER_PUB from this server (nothing was changed)."; return; fi
+    fi
+    rm -f "$FAM_FILE"
     write_config
     load_config
-    systemctl restart "$APP" && ok "Tunnel restarted with the new addresses (IPv${FAM})."
+    systemctl restart "$APP" && ok "Tunnel restarted with the new addresses (primary IPv${PRI_FAM})."
     print_token
     warn "Kharej server: run this option (15) and paste the token above. The link stays down until both sides match."
     fw_hint
@@ -2560,22 +2960,20 @@ change_addresses() {
     parse_token "$tok" || { err "Invalid token."; return; }
     [[ $T_MASTER == "$MASTER" ]] || { err "That token belongs to a different tunnel (key mismatch)."; return; }
     [[ $T_ENGINE == "$ENGINE" ]] || { err "That token was made for another engine (${T_ENGINE})."; return; }
-    IRAN_IP=$(ask_addr "Iran server public IP [${T_IRAN}]: " "$T_IRAN")
-    FAM=$(addr_fam "$IRAN_IP")
-    if [[ $FAM != "$(addr_fam "$T_KHAREJ")" ]]; then
-      err "The token was made for IPv$(addr_fam "$T_KHAREJ") but ${IRAN_IP} is an IPv${FAM} address (nothing was changed)."
-      return
+    adopt_token_settings
+    ask_addresses_kharej
+    ensure_deps      || return
+    check_kernel_all || return
+    if ! route_info "$PEER_PUB"; then
+      if (( ALT )); then warn "No route to the Iran server $PEER_PUB over IPv${FAM} from this server right now."
+      else err "No route to the Iran server $PEER_PUB (nothing was changed)."; return; fi
     fi
-    KHAREJ_IP=$T_KHAREJ; MODE=$T_MODE; UDP_PORT=$T_UDP; PORTS=$(norm_ports "$T_PORTS"); FWD_PROTO=$T_PROTO
-    BH_TRANSPORT=$T_BHTR; BH_TARGET=$T_BHTARGET
-    ensure_deps  || return
-    check_kernel || return
-    route_info "$IRAN_IP" || { err "No route to the Iran server $IRAN_IP (nothing was changed)."; return; }
+    rm -f "$FAM_FILE"
     write_config
     load_config
     restart_tunnel
     info "Waiting for the tunnel (up to 20 s)..."
-    if wait_link 20; then ok "Tunnel is UP - ${PEER_INNER} answers ping."; else warn "No answer yet - running the diagnosis..."; diagnose; fi
+    if wait_link 20; then ok "Tunnel is UP - ${PEER_INNER} answers ping (IPv${FAM})."; else warn "No answer yet - running the diagnosis..."; diagnose; fi
     fw_hint
   fi
 }
@@ -2590,7 +2988,7 @@ change_transport() {
   if [[ $ROLE == iran ]]; then
     info "Current transport: $( [[ $MODE == udp ]] && echo "ESP-in-UDP, port $UDP_PORT" || echo "raw ESP (IP protocol 50)" )"
     ask_transport
-    if [[ $MODE == udp && $ENGINE == backhaul ]] && ports_include "$PORTS" "$UDP_PORT"; then
+    if [[ $MODE == udp && $ENGINE == backhaul ]] && { ports_include "$PORTS" "$UDP_PORT" || ports_include "$PORTS_REV" "$UDP_PORT"; }; then
       err "UDP port $UDP_PORT is in the forwarded port list - choose another transport port (nothing was changed)."
       return
     fi
@@ -2611,8 +3009,7 @@ change_transport() {
     parse_token "$tok" || { err "Invalid token."; return; }
     [[ $T_MASTER == "$MASTER" ]] || { err "That token belongs to a different tunnel (key mismatch)."; return; }
     [[ $T_ENGINE == "$ENGINE" ]] || { err "That token was made for another engine (${T_ENGINE})."; return; }
-    MODE=$T_MODE; UDP_PORT=$T_UDP; PORTS=$(norm_ports "$T_PORTS"); FWD_PROTO=$T_PROTO
-    BH_TRANSPORT=$T_BHTR; BH_TARGET=$T_BHTARGET
+    adopt_token_settings
     ensure_deps || return
     write_config
     load_config
@@ -2630,24 +3027,38 @@ show_token() {
 }
 
 restart_tunnel() {
+  local d
   load_config 2>/dev/null || { warn "Tunnel is not installed."; return; }
   install_self 2>/dev/null                     # picks up a newer version of this script
   write_unit
-  [[ $ENGINE == backhaul ]] && write_bh_unit
+  if [[ $ENGINE == backhaul ]]; then
+    for d in $(bh_dirs); do write_bh_unit "$d"; done
+    if [[ -z $PORTS_REV ]]; then
+      systemctl disable --now "$BH_UNIT_REV" >/dev/null 2>&1
+      rm -f "$BH_UNIT_FILE_REV"
+    fi
+  fi
   legacy_rathole_cleanup
   systemctl daemon-reload
   systemctl restart "$APP" && ok "Tunnel restarted."
   if [[ $ENGINE == backhaul ]]; then
-    systemctl restart "$BH_UNIT" && ok "Backhaul restarted."
+    for d in $(bh_dirs); do
+      bh_dir "$d"
+      systemctl restart "$D_UNIT" && ok "Backhaul ${D_NAME} restarted."
+    done
   fi
 }
 
 update_backhaul() {
+  local d
   load_config 2>/dev/null || { warn "Tunnel is not installed."; return; }
   if [[ $ENGINE != backhaul ]]; then warn "This install does not use Backhaul (legacy DNAT engine) - re-install to switch."; return; fi
   ensure_deps || return
   ensure_backhaul force || return
-  systemctl restart "$BH_UNIT" && ok "Backhaul restarted with core v$(bh_version)."
+  for d in $(bh_dirs); do
+    bh_dir "$d"
+    systemctl restart "$D_UNIT" && ok "Backhaul ${D_NAME} restarted with core v$(bh_version)."
+  done
 }
 
 change_watchdog() {
@@ -2705,7 +3116,7 @@ banner() {
   echo "${C_B}   Iran ${IP_IRAN}  <=======  ESP  =======>  Kharej ${IP_KHAREJ}${C_0}"
   echo "${C_B}==============================================================${C_0}"
   if load_config 2>/dev/null; then
-    echo " Installed role: $ROLE   |   IPv${FAM}   |   engine: $ENGINE$( [[ $ENGINE == backhaul ]] && echo " ($BH_TRANSPORT)" )   |   service: $(systemctl is-active "$APP" 2>/dev/null)"
+    echo " Installed role: $ROLE   |   IPv${FAM}$( (( ALT && FAILOVER )) && echo " (fail-over on)" )   |   engine: $ENGINE$( [[ $ENGINE == backhaul ]] && echo " ($BH_TRANSPORT)" )   |   service: $(systemctl is-active "$APP" 2>/dev/null)"
     if [[ $ENGINE == rathole ]]; then
       warn "This install still uses the old Rathole engine, which is no longer part of this script - run option 5, then option 1 / 2 to switch to Backhaul."
     fi
@@ -2725,7 +3136,7 @@ menu() {
     echo "  4) Live Log"
     echo "  5) Uninstall Full Tunnel"
     echo "  ------------------------------------"
-    echo "  6) Change forwarded ports + target (Iran) / sync ports (Kharej)"
+    echo "  6) Change forwarded ports, both directions (Iran) / sync them (Kharej)"
     echo "  7) Restart tunnel"
     echo "  8) Show token (Iran)"
     echo "  9) Watchdog / MTU / network tuning settings"
@@ -2734,7 +3145,7 @@ menu() {
     echo " 12) Change transport / UDP port (Iran first, then Kharej)"
     echo " 13) Sync system clock (keys depend on it)"
     echo " 14) Change Backhaul transport (Iran first, then Kharej)"
-    echo " 15) Change server IPs / IPv4 <-> IPv6 (Iran first, then Kharej)"
+    echo " 15) Change server addresses IPv4 + IPv6 / primary IP version (Iran first, then Kharej)"
     echo "  0) Exit"
     echo
     read -r -p "Select: " ch || exit 0
@@ -2771,7 +3182,7 @@ main() {
     status)   need_root; cmd_status ;;
     diag)     need_root; diagnose ;;
     daemon)   need_root; cmd_daemon ;;
-    bh-run)   need_root; cmd_bh_run ;;
+    bh-run)   need_root; cmd_bh_run "${2:-fwd}" ;;
     rh-run)   need_root; log "the old Rathole engine was replaced by Backhaul - disabling the old unit (re-install: menu 5, then 1 / 2)"; legacy_rathole_cleanup ;;
     teardown) need_root; cmd_teardown ;;
     fw)       need_root; cmd_fw ;;
